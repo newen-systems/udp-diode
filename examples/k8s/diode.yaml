@@ -1,0 +1,208 @@
+# Sender and receiver in one Kubernetes namespace, for an end-to-end test with NiFi.
+#
+#   NiFi InvokeHTTP -> udp-diode-sender:8080 -> UDP 9400 -> udp-diode-receiver -> DIODE_DELIVERY_URL
+#
+# Both roles run in one namespace here, so NetworkPolicy (not a physical link) keeps the data
+# path one-way: the receiver accepts only UDP 9400 from the sender and may only reach the
+# delivery URL and DNS. With DIODE_FEEDBACK=receipts the receiver may also send UDP 9401 to the
+# sender. The Secret udp-diode-keys (api_token, data_key, receipt_key) is created out of band.
+#
+#   kubectl -n <ns> apply -f examples/k8s/diode.yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: udp-diode-sender
+spec:
+  accessModes: [ReadWriteOnce]
+  resources: {requests: {storage: 3Gi}}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: udp-diode-receiver
+spec:
+  accessModes: [ReadWriteOnce]
+  resources: {requests: {storage: 3Gi}}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: udp-diode-sender
+data:
+  DIODE_MODE: sender
+  DIODE_FEEDBACK: receipts
+  DIODE_STATE_DIR: /var/lib/diode
+  DIODE_API_TOKEN_FILE: /run/secrets/diode/api_token
+  DIODE_DATA_KEY_FILE: /run/secrets/diode/data_key
+  DIODE_RECEIPT_KEY_FILE: /run/secrets/diode/receipt_key
+  DIODE_DATA_PEER: udp-diode-receiver:9400
+  DIODE_MAX_BITRATE_MBPS: "200"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: udp-diode-receiver
+data:
+  DIODE_MODE: receiver
+  DIODE_FEEDBACK: receipts
+  DIODE_STATE_DIR: /var/lib/diode
+  DIODE_API_TOKEN_FILE: /run/secrets/diode/api_token
+  DIODE_DATA_KEY_FILE: /run/secrets/diode/data_key
+  DIODE_RECEIPT_KEY_FILE: /run/secrets/diode/receipt_key
+  DIODE_RECEIPT_PEER: udp-diode-sender-receipts:9401
+  DIODE_DELIVERY_URL: http://udp-diode-nifi-listen:9095/contentListener
+  DIODE_RAM_MAX_BYTES: "67108864"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: udp-diode-sender
+  labels: {app.kubernetes.io/name: udp-diode, app.kubernetes.io/component: sender}
+spec:
+  replicas: 1
+  strategy: {type: Recreate}
+  selector:
+    matchLabels: {app.kubernetes.io/name: udp-diode, app.kubernetes.io/component: sender}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: udp-diode, app.kubernetes.io/component: sender}
+    spec:
+      automountServiceAccountToken: false
+      imagePullSecrets: [{name: nifi-artifactory-pull}]
+      securityContext: {runAsNonRoot: true, runAsUser: 10001, runAsGroup: 10001, fsGroup: 10001, seccompProfile: {type: RuntimeDefault}}
+      terminationGracePeriodSeconds: 20
+      containers:
+        - name: diode
+          image: newen-docker-dev.artifactory.newen.au/udp-diode@sha256:f8f04a29d560e1f103608787f10c1e8b863e983cd252a671d1de4e7d2c67dc74
+          envFrom: [{configMapRef: {name: udp-diode-sender}}]
+          ports:
+            - {name: http, containerPort: 8080, protocol: TCP}
+            - {name: receipts, containerPort: 9401, protocol: UDP}
+          readinessProbe: {httpGet: {path: /readyz, port: http}, periodSeconds: 5}
+          livenessProbe: {httpGet: {path: /healthz, port: http}, periodSeconds: 10}
+          resources:
+            requests: {cpu: 250m, memory: 128Mi}
+            limits: {cpu: "2", memory: 512Mi}
+          securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
+          volumeMounts:
+            - {name: state, mountPath: /var/lib/diode}
+            - {name: keys, mountPath: /run/secrets/diode, readOnly: true}
+            - {name: tmp, mountPath: /tmp}
+      volumes:
+        - {name: state, persistentVolumeClaim: {claimName: udp-diode-sender}}
+        - {name: keys, secret: {secretName: udp-diode-keys, defaultMode: 0440}}
+        - {name: tmp, emptyDir: {sizeLimit: 16Mi}}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: udp-diode-receiver
+  labels: {app.kubernetes.io/name: udp-diode, app.kubernetes.io/component: receiver}
+spec:
+  replicas: 1
+  strategy: {type: Recreate}
+  selector:
+    matchLabels: {app.kubernetes.io/name: udp-diode, app.kubernetes.io/component: receiver}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: udp-diode, app.kubernetes.io/component: receiver}
+    spec:
+      automountServiceAccountToken: false
+      imagePullSecrets: [{name: nifi-artifactory-pull}]
+      securityContext: {runAsNonRoot: true, runAsUser: 10001, runAsGroup: 10001, fsGroup: 10001, seccompProfile: {type: RuntimeDefault}}
+      terminationGracePeriodSeconds: 20
+      containers:
+        - name: diode
+          image: newen-docker-dev.artifactory.newen.au/udp-diode@sha256:f8f04a29d560e1f103608787f10c1e8b863e983cd252a671d1de4e7d2c67dc74
+          envFrom: [{configMapRef: {name: udp-diode-receiver}}]
+          ports:
+            - {name: http, containerPort: 8080, protocol: TCP}
+            - {name: data, containerPort: 9400, protocol: UDP}
+          readinessProbe: {httpGet: {path: /readyz, port: http}, periodSeconds: 5}
+          livenessProbe: {httpGet: {path: /healthz, port: http}, periodSeconds: 10}
+          resources:
+            requests: {cpu: 250m, memory: 256Mi}
+            limits: {cpu: "2", memory: 768Mi}
+          securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
+          volumeMounts:
+            - {name: state, mountPath: /var/lib/diode}
+            - {name: keys, mountPath: /run/secrets/diode, readOnly: true}
+            - {name: tmp, mountPath: /tmp}
+      volumes:
+        - {name: state, persistentVolumeClaim: {claimName: udp-diode-receiver}}
+        - {name: keys, secret: {secretName: udp-diode-keys, defaultMode: 0440}}
+        - {name: tmp, emptyDir: {sizeLimit: 16Mi}}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: udp-diode-sender
+spec:
+  selector: {app.kubernetes.io/name: udp-diode, app.kubernetes.io/component: sender}
+  ports: [{name: http, port: 8080, targetPort: http, protocol: TCP}]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: udp-diode-sender-receipts
+spec:
+  selector: {app.kubernetes.io/name: udp-diode, app.kubernetes.io/component: sender}
+  ports: [{name: receipts, port: 9401, targetPort: receipts, protocol: UDP}]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: udp-diode-receiver
+spec:
+  selector: {app.kubernetes.io/name: udp-diode, app.kubernetes.io/component: receiver}
+  ports:
+    - {name: data, port: 9400, targetPort: data, protocol: UDP}
+    - {name: http, port: 8080, targetPort: http, protocol: TCP}
+---
+# The NiFi ListenHTTP processor on every NiFi node; the receiver POSTs here.
+apiVersion: v1
+kind: Service
+metadata:
+  name: udp-diode-nifi-listen
+spec:
+  selector: {app: nifi, nifi_cr: nifi}
+  ports: [{name: listen, port: 9095, targetPort: 9095, protocol: TCP}]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: udp-diode-receiver
+spec:
+  podSelector:
+    matchLabels: {app.kubernetes.io/name: udp-diode, app.kubernetes.io/component: receiver}
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from: [{podSelector: {matchLabels: {app.kubernetes.io/name: udp-diode, app.kubernetes.io/component: sender}}}]
+      ports: [{port: 9400, protocol: UDP}]
+    # kubelet probes and operator reads of /v1/stats
+    - ports: [{port: 8080, protocol: TCP}]
+  egress:
+    - to: [{podSelector: {matchLabels: {app: nifi, nifi_cr: nifi}}}]
+      ports: [{port: 9095, protocol: TCP}]
+    - to: [{podSelector: {matchLabels: {app.kubernetes.io/name: udp-diode, app.kubernetes.io/component: sender}}}]
+      ports: [{port: 9401, protocol: UDP}]
+    - to: [{namespaceSelector: {}, podSelector: {matchLabels: {k8s-app: kube-dns}}}]
+      ports: [{port: 53, protocol: UDP}, {port: 53, protocol: TCP}]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: udp-diode-sender
+spec:
+  podSelector:
+    matchLabels: {app.kubernetes.io/name: udp-diode, app.kubernetes.io/component: sender}
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from: [{podSelector: {matchLabels: {app.kubernetes.io/name: udp-diode, app.kubernetes.io/component: receiver}}}]
+      ports: [{port: 9401, protocol: UDP}]
+    - ports: [{port: 8080, protocol: TCP}]
+  egress:
+    - to: [{podSelector: {matchLabels: {app.kubernetes.io/name: udp-diode, app.kubernetes.io/component: receiver}}}]
+      ports: [{port: 9400, protocol: UDP}]
+    - to: [{namespaceSelector: {}, podSelector: {matchLabels: {k8s-app: kube-dns}}}]
+      ports: [{port: 53, protocol: UDP}, {port: 53, protocol: TCP}]

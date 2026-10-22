@@ -1,0 +1,101 @@
+# Local loopback demo of the two roles on one Docker host.
+#
+#   low network ---- sender -> relay-fwd ===> receiver ---- high network (internal) ---- sink
+#
+# The receiver and sink sit on an internal network: no gateway, no published ports, and no
+# path to the low network except the one-way relay. With feedback off there is no relay in the
+# other direction and the receiver opens no socket that could use one.
+# One host is a functional demonstration, not a security boundary: separate hosts or
+# networks with firewall policy are needed for that.
+#
+#   examples/make-secrets.sh
+#   DOCKER_CONTEXT=colima docker compose -f examples/compose.yml up -d --build --wait
+#   examples/demo.sh            # or demo.sh receipts
+name: udp-diode-demo
+
+x-hardened: &hardened
+  image: udp-diode:dev
+  build: {context: .., dockerfile: Dockerfile}
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  init: true
+  tmpfs: ["/tmp:size=16m"]
+  restart: unless-stopped
+  stop_grace_period: 20s
+  pids_limit: 128
+
+x-relay: &relay
+  <<: *hardened
+  entrypoint: ["python", "/relay.py"]
+  volumes: ["../soft_diode_relay.py:/relay.py:ro"]
+  # replaces the image's HEALTHCHECK (which probes the diode HTTP port): is the UDP listener bound?
+  healthcheck: {test: ["CMD-SHELL", "grep -qi ':24B8 ' /proc/net/udp"], interval: 3s}
+  mem_limit: 128m
+  cpus: 1.0
+
+services:
+  sender:
+    <<: *hardened
+    env_file: [sender.env]
+    secrets: [api_token, data_key]
+    volumes: ["sender-state:/var/lib/diode"]
+    networks: {low: {}}
+    ports: ["127.0.0.1:${SENDER_HTTP_PORT:-38080}:8080"]
+    depends_on: [relay-fwd]
+    mem_limit: 512m
+    cpus: 1.5
+
+  relay-fwd:
+    <<: *relay
+    command: ["--listen-host", "172.31.10.5", "--listen-port", "9400",
+              "--forward-host", "receiver", "--forward-port", "9400",
+              "--forward-bind", "172.31.20.5"]
+    networks:
+      low: {ipv4_address: 172.31.10.5}
+      high: {ipv4_address: 172.31.20.5}
+    depends_on: [receiver]
+
+  receiver:
+    <<: *hardened
+    env_file: [receiver.env]
+    secrets: [api_token, data_key]
+    volumes: ["receiver-state:/var/lib/diode"]
+    networks: {high: {}}
+    depends_on: [sink]
+    mem_limit: 768m
+    cpus: 1.5
+
+  sink:
+    image: udp-diode:dev
+    build: {context: .., dockerfile: Dockerfile}
+    entrypoint: ["python", "/sink.py"]
+    volumes: ["./sink.py:/sink.py:ro"]
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    init: true
+    networks: {high: {}, view: {}}
+    ports: ["127.0.0.1:${SINK_PORT:-38081}:8081"]
+    mem_limit: 128m
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://127.0.0.1:8081/healthz', timeout=3)"]
+      interval: 5s
+
+networks:
+  low:
+    ipam: {config: [{subnet: 172.31.10.0/24}]}
+  high:
+    internal: true
+    ipam: {config: [{subnet: 172.31.20.0/24}]}
+  view:
+    ipam: {config: [{subnet: 172.31.30.0/24}]}
+
+volumes:
+  sender-state:
+  receiver-state:
+
+secrets:
+  api_token: {file: ./secrets/api_token}
+  data_key: {file: ./secrets/data_key}
+  receipt_key: {file: ./secrets/receipt_key}

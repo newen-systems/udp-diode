@@ -1,0 +1,11 @@
+# Allow-list: the image needs the runtime modules and nothing else.
+*
+!protocol.py
+!receipts.py
+!catcher.py
+!pitcher.py
+!diode.py
+!diode_config.py
+!diode_http.py
+!diode_sender.py
+!diode_receiver.py

@@ -1,3 +1,5 @@
+.agent/
+.agents/
 __pycache__/
 *.py[cod]
 *.egg-info/
@@ -14,3 +16,4 @@ venv/
 htmlcov/
 dist/
 build/
+examples/secrets/

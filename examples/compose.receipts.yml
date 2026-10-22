@@ -1,0 +1,30 @@
+# Adds restricted receipts: a second one-way relay carries authenticated STATUS frames
+# from the receiver back to the sender. Use together with compose.yml:
+#   docker compose -f examples/compose.yml -f examples/compose.receipts.yml up -d --build --wait
+# Only bounded STATUS datagrams (transfer id, kind, counts, a hole list, HMAC) cross the
+# reverse path. It reduces, and does not remove, the exposed capability; if zero
+# high-to-low flow is required, use compose.yml alone.
+services:
+  sender:
+    env_file: [sender.env, sender.receipts.env]
+    secrets: [api_token, data_key, receipt_key]
+  receiver:
+    env_file: [receiver.env, receiver.receipts.env]
+    secrets: [api_token, data_key, receipt_key]
+  relay-rev:
+    image: udp-diode:dev
+    build: {context: .., dockerfile: Dockerfile}
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    init: true
+    entrypoint: ["python", "/relay.py"]
+    volumes: ["../soft_diode_relay.py:/relay.py:ro"]
+    healthcheck: {test: ["CMD-SHELL", "grep -qi ':24B9 ' /proc/net/udp"], interval: 3s}
+    command: ["--listen-host", "172.31.20.6", "--listen-port", "9401",
+              "--forward-host", "sender", "--forward-port", "9401",
+              "--forward-bind", "172.31.10.6"]
+    networks:
+      low: {ipv4_address: 172.31.10.6}
+      high: {ipv4_address: 172.31.20.6}
+    mem_limit: 128m
