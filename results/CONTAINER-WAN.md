@@ -14,7 +14,7 @@ the tables below for what the sink received). Driver: `scripts/http_bench.py`.
 
 ## NiFi end to end (same cluster)
 
-NiFi 2.12 with sender and receiver pods in its namespace (`examples/k8s/diode.yaml`,
+NiFi 2.12 with sender and receiver pods in its namespace (an earlier, NiFi-specific version of `examples/k8s`,
 NetworkPolicy keeping UDP one-way): GenerateFlowFile (4 MB random, attribute `test.origin`),
 CryptographicHashContent, PackageFlowFile (FlowFile v3), InvokeHTTP POST to the sender with
 `Idempotency-Key: ${uuid}`; the receiver delivered to ListenHTTP, then UnpackContent,

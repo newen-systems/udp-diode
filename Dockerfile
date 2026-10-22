@@ -19,6 +19,17 @@ COPY --chmod=0444 protocol.py receipts.py catcher.py pitcher.py \
 # Byte-compile at build time so a read-only root filesystem needs no __pycache__ writes.
 RUN python -m compileall -q /app
 
+# Version metadata last, so a new revision does not rebuild the layers above.
+ARG APP_VERSION=dev
+ARG APP_REVISION=unknown
+LABEL org.opencontainers.image.title="udp-diode" \
+      org.opencontainers.image.description="One-way UDP transfer with HTTP custody on both sides" \
+      org.opencontainers.image.source="https://github.com/newen-systems/udp-diode" \
+      org.opencontainers.image.licenses="MIT" \
+      org.opencontainers.image.version="${APP_VERSION}" \
+      org.opencontainers.image.revision="${APP_REVISION}"
+ENV APP_VERSION=${APP_VERSION} APP_REVISION=${APP_REVISION}
+
 USER 10001:10001
 VOLUME /var/lib/diode
 EXPOSE 8080/tcp 9400/udp 9401/udp

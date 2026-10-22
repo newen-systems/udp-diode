@@ -36,7 +36,7 @@ from diode_http import (
     make_ssl_context,
     serve_in_thread,
 )
-from protocol import MAX_CONTENT_TYPE_LEN
+from protocol import MAX_CONTENT_TYPE_LEN, frame_key
 from receipts import ReceiptStore
 
 IDEM_RE = re.compile(r"[A-Za-z0-9._:-]{1,128}")
@@ -251,6 +251,14 @@ class SenderService:
             self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, cfg.sndbuf)
         else:
             pitcher._configure_send_buf(self.sock, cfg.chunk_size + 256)
+        self.frame_key = frame_key(cfg.data_key) if cfg.frame_auth else None
+        if not cfg.frame_auth:
+            print("warn: DIODE_FRAME_AUTH=off: one forged datagram can block a transfer; "
+                  "only use it on a trusted path", file=sys.stderr)
+        self.heartbeat = (
+            pitcher.Heartbeat(self.sock, self.dest, cfg.heartbeat_s, self.frame_key)
+            if cfg.heartbeat_s > 0 else None
+        )
         self.rx_store: ReceiptStore | None = None
         self.rx_catcher: Catcher | None = None
         self.rx_sock: socket.socket | None = None
@@ -343,6 +351,8 @@ class SenderService:
             "wire_bytes_first": c.get("wire_bytes_first", 0),
             "retry_bytes": c.get("wire_bytes_retry", 0),
             "spool_unpurged_bytes": self.ledger.unpurged_bytes(),
+            "frame_auth": self.cfg.frame_auth,
+            "heartbeats_sent": self.heartbeat.seq if self.heartbeat else 0,
             "disk_free_bytes": self.disk_free(),
         }
         if self.cfg.feedback == "receipts" and self.rx_catcher is not None:
@@ -429,7 +439,8 @@ class SenderService:
             if path.stat().st_size != row["size"]:
                 raise OSError("size changed")
             prepared = pitcher.prepare_transfer(
-                path, tid, cfg.chunk_size, cfg.parity_group, cfg.data_key, row["content_type"]
+                path, tid, cfg.chunk_size, cfg.parity_group, cfg.data_key, row["content_type"],
+                list(cfg.parity_families) or None,
             )
         except OSError:
             self.ledger.set_state(tid, "failed", "source-missing")
@@ -446,7 +457,7 @@ class SenderService:
                 sock, self.dest, path, prepared,
                 chunk_size=cfg.chunk_size, parity_group=cfg.parity_group,
                 meta_copies=cfg.meta_copies, eof_copies=cfg.eof_copies,
-                pacer=self.pacer, stop=self.stop_event,
+                pacer=self.pacer, stop=self.stop_event, key=self.frame_key,
             )
 
         if self.rx_store is not None:
@@ -473,6 +484,7 @@ class SenderService:
                 max_timeout_s=cfg.ack_timeout_cap_s, meta_copies=cfg.meta_copies,
                 eof_copies=cfg.eof_copies, pacer=self.pacer, budget_s=cfg.retry_budget_s,
                 stop=self.stop_event, repass=lambda: do_pass(retry),
+                frame_key=self.frame_key,
             )
             rc = pitcher.watch_receipts_and_resend(retry, self.dest, job)
             if rc == 0:
@@ -523,6 +535,10 @@ class SenderService:
             self.threads.append(t)
         if self.rx_sock is not None:
             t = threading.Thread(target=self._receipt_loop, name="receipts", daemon=True)
+            t.start()
+            self.threads.append(t)
+        if self.heartbeat is not None:
+            t = threading.Thread(target=self.heartbeat.run, args=(self.stop_event,), name="heartbeat", daemon=True)
             t.start()
             self.threads.append(t)
         t = threading.Thread(target=self._housekeeping, name="housekeeping", daemon=True)

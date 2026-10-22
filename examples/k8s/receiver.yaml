@@ -1,0 +1,78 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: udp-diode-receiver
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: udp-diode-receiver
+spec:
+  accessModes: [ReadWriteOnce]
+  resources: {requests: {storage: 4Gi}}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: udp-diode-receiver
+  labels: {app.kubernetes.io/name: udp-diode, app.kubernetes.io/component: receiver}
+spec:
+  replicas: 1
+  strategy: {type: Recreate}
+  revisionHistoryLimit: 3
+  selector:
+    matchLabels: {app.kubernetes.io/name: udp-diode, app.kubernetes.io/component: receiver}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: udp-diode, app.kubernetes.io/component: receiver}
+    spec:
+      serviceAccountName: udp-diode-receiver
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile: {type: RuntimeDefault}
+      terminationGracePeriodSeconds: 20
+      containers:
+        - name: diode
+          image: udp-diode
+          envFrom: [{configMapRef: {name: udp-diode-receiver}}]
+          ports:
+            - {name: http, containerPort: 8080, protocol: TCP}
+            - {name: data, containerPort: 9400, protocol: UDP}
+          livenessProbe: {httpGet: {path: /healthz, port: http}, periodSeconds: 10, timeoutSeconds: 3}
+          readinessProbe: {httpGet: {path: /readyz, port: http}, periodSeconds: 5, timeoutSeconds: 3}
+          # Memory limit above DIODE_RAM_BUDGET_BYTES plus working set.
+          resources:
+            requests: {cpu: 250m, memory: 256Mi}
+            limits: {memory: 768Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
+          volumeMounts:
+            - {name: state, mountPath: /var/lib/diode}
+            - {name: keys, mountPath: /run/secrets/diode, readOnly: true}
+            - {name: tmp, mountPath: /tmp}
+      volumes:
+        - {name: state, persistentVolumeClaim: {claimName: udp-diode-receiver}}
+        - name: keys
+          secret:
+            secretName: udp-diode-keys
+            defaultMode: 0440
+            items: [{key: api_token, path: api_token}, {key: data_key, path: data_key}]
+        - {name: tmp, emptyDir: {sizeLimit: 16Mi}}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: udp-diode-receiver
+  labels: {app.kubernetes.io/name: udp-diode, app.kubernetes.io/component: receiver}
+spec:
+  selector: {app.kubernetes.io/name: udp-diode, app.kubernetes.io/component: receiver}
+  ports:
+    - {name: data, port: 9400, targetPort: data, protocol: UDP}
+    - {name: http, port: 8080, targetPort: http, protocol: TCP}

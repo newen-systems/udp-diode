@@ -3,28 +3,29 @@
 # check the sink received byte-identical bodies.
 #   examples/demo.sh            feedback off (strict one-way)
 #   examples/demo.sh receipts   restricted receipts on
-# Uses DOCKER_CONTEXT (default: colima). Brings the stack up and tears it down, volumes included.
+# COMPOSE picks the engine: "docker compose" (default) or "podman compose". Brings the stack up and
+# tears it down, volumes included.
 set -euo pipefail
 cd "$(dirname "$0")"
 MODE="${1:-off}"
-export DOCKER_CONTEXT="${DOCKER_CONTEXT:-colima}"
 export SENDER_HTTP_PORT="${SENDER_HTTP_PORT:-38080}" SINK_PORT="${SINK_PORT:-38081}"
 FILES=(-f compose.yml)
 if [[ "$MODE" == receipts ]]; then FILES+=(-f compose.receipts.yml); fi
-DC=(docker compose "${FILES[@]}")
-sha() { shasum -a 256 "$1" | cut -d' ' -f1; }
+read -r -a DC <<<"${COMPOSE:-docker compose}"
+DC+=("${FILES[@]}")
+sha() { if command -v sha256sum >/dev/null; then sha256sum "$1"; else shasum -a 256 "$1"; fi | cut -d' ' -f1; }
 
 ./make-secrets.sh
 WORK="$(mktemp -d)"
 cleanup() {
   "${DC[@]}" down -v --remove-orphans >/dev/null 2>&1 || true
-  rm -f "$WORK/big.bin" "$WORK/small.bin"
+  rm -f "$WORK/big.bin" "$WORK/small.bin" "$WORK/auth"
   rmdir "$WORK" 2>/dev/null || true
 }
 trap cleanup EXIT
 
 "${DC[@]}" up -d --build --wait
-TOKEN="$(cat secrets/api_token)"
+(umask 077; printf 'Authorization: Bearer %s\n' "$(cat secrets/api_token)" >"$WORK/auth")  # keeps the token out of ps
 head -c $((50 * 1024 * 1024)) /dev/urandom >"$WORK/big.bin"
 head -c 1024 /dev/urandom >"$WORK/small.bin"
 BIG_SHA="$(sha "$WORK/big.bin")"
@@ -32,7 +33,7 @@ SMALL_SHA="$(sha "$WORK/small.bin")"
 
 post() { # file key
   curl -sS --fail-with-body -X POST "http://127.0.0.1:${SENDER_HTTP_PORT}/v1/transfers" \
-    -H "Authorization: Bearer ${TOKEN}" -H "Idempotency-Key: $2" \
+    -H @"$WORK/auth" -H "Idempotency-Key: $2" \
     -H "Content-Type: application/octet-stream" --data-binary "@$1"
 }
 jid() { python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])'; }
@@ -65,13 +66,13 @@ sys.exit(0 if ok else 1)
 PY
 sleep 3
 for id in "$BIG_ID" "$SMALL_ID"; do
-  curl -sS -H "Authorization: Bearer ${TOKEN}" "http://127.0.0.1:${SENDER_HTTP_PORT}/v1/transfers/$id" |
+  curl -sS -H @"$WORK/auth" "http://127.0.0.1:${SENDER_HTTP_PORT}/v1/transfers/$id" |
     python3 -c 'import json,sys; d=json.load(sys.stdin); print("sender state:", d["state"], "receiver_confirmed:", d["receiver_confirmed"])'
 done
 echo "--- image"
 docker image ls udp-diode:dev --format 'size={{.Size}} id={{.ID}}'
 echo "--- containers (docker stats MemUsage is cgroup memory, RSS plus page cache)"
-docker stats --no-stream --format '{{.Name}} mem={{.MemUsage}} cpu={{.CPUPerc}}' $("${DC[@]}" ps -q sender receiver relay-fwd)
+"${DC[0]}" stats --no-stream --format '{{.Name}} mem={{.MemUsage}} cpu={{.CPUPerc}}' $("${DC[@]}" ps -q sender receiver relay-fwd)
 for svc in sender receiver; do
   echo "--- $svc RSS (VmRSS/VmHWM of the python process)"
   "${DC[@]}" exec -T "$svc" sh -c 'for p in /proc/[0-9]*; do if grep -q diode.py $p/cmdline 2>/dev/null; then grep -E "VmRSS|VmHWM" $p/status; fi; done' || true

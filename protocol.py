@@ -7,7 +7,10 @@ The magic is the wire version. DIO1 peers (unauthenticated chunk geometry,
 EOF-supplied metadata) are rejected with a clear error instead of being
 silently downgraded to.
 
-Types: META=1, DATA=2, EOF=3, PARITY=4, STATUS=5
+Types: META=1, DATA=2, EOF=3, PARITY=4, STATUS=5, HEARTBEAT=6
+flags bit 0 (FLAG_AUTH): a 16-byte truncated HMAC-SHA256 tag sits between body
+and CRC. It covers everything before it, so every frame (DATA and PARITY
+included) is bound to the data key, not just META.
 CRC covers everything before the CRC field.
 
 STATUS is the payload of the **validate track** (a second one-way stream,
@@ -41,6 +44,8 @@ MAGIC = b"DIO2"
 LEGACY_MAGIC = b"DIO1"
 HEADER_STRUCT = struct.Struct("!4sBBHI")  # magic, type, flags, header_len, body_len
 CRC_STRUCT = struct.Struct("!I")
+FLAG_AUTH = 0x01
+AUTH_TAG_LEN = 16
 # UDP practical body; leave room for IP/UDP + JSON DATA header under ~1500 MTU / WG.
 DEFAULT_CHUNK_SIZE = 1200
 # Soft limit for in-memory build_transfer_frames (tests / small lab only).
@@ -52,6 +57,12 @@ MAX_CHUNK_SIZE = 8192
 MAX_CHUNKS = 1 << 26
 MAX_TOTAL_LEN = MAX_CHUNKS * MAX_CHUNK_SIZE
 MAX_PARITY_GROUP = 256
+# Parity families: each is (group, stride). Group j of a block of group*stride
+# chunks holds every stride-th chunk, so a burst shorter than the stride costs a
+# group at most one chunk. Several families with distinct strides put every
+# chunk in several groups that share no other member; the receiver peels.
+MAX_PARITY_STRIDE = 256
+MAX_PARITY_FAMILIES = 4
 MAX_CONTENT_TYPE_LEN = 128
 # Default IP MTU budget. Datagram = MTU - 20 (IPv4) - 8 (UDP).
 DEFAULT_MTU = 1500
@@ -65,6 +76,7 @@ class FrameType(IntEnum):
     EOF = 3
     PARITY = 4
     STATUS = 5
+    HEARTBEAT = 6
 
 
 # Reverse-channel STATUS kinds. Keep this set closed: the pitcher treats
@@ -86,13 +98,44 @@ class ProtocolError(ValueError):
     pass
 
 
+class FrameAuthError(ProtocolError):
+    """Frame tag missing or wrong for the configured data key."""
+
+
+def frame_key(secret: bytes) -> bytes:
+    """Per-frame MAC key, derived so it never equals the META HMAC key itself."""
+    return _hmac.digest(secret, b"DIO2-FRAME-KEY", "sha256")
+
+
+def drop_reason(exc: ProtocolError) -> str:
+    """Short, closed label for why decode_frame refused a datagram (for drop counters)."""
+    if isinstance(exc, FrameAuthError):
+        return "auth"
+    msg = str(exc)
+    for prefix, reason in (
+        ("crc mismatch", "crc"),
+        ("legacy DIO1", "legacy"),
+        ("bad magic", "magic"),
+        ("unknown flags", "magic"),
+        ("length mismatch", "length"),
+        ("datagram too short", "length"),
+        ("unknown type", "type"),
+        ("bad header json", "json"),
+        ("header is not", "json"),
+    ):
+        if msg.startswith(prefix):
+            return reason
+    return "schema"
+
+
 @dataclass(frozen=True)
 class Frame:
     type: FrameType
     header: dict[str, Any]
     body: bytes = b""
 
-    def encode(self) -> bytes:
+    def encode(self, key: bytes | None = None) -> bytes:
+        """Wire bytes. With ``key`` (from :func:`frame_key`) the frame carries an auth tag."""
         # Validate on the way out too: a sender must not emit a frame that no
         # conforming receiver would accept.
         _check_header(self.type, self.header, self.body)
@@ -105,9 +148,11 @@ class Frame:
                 "META must stay compact (no full chunk_lens for large files)"
             )
         prefix = HEADER_STRUCT.pack(
-            MAGIC, int(self.type), 0, len(header_bytes), len(self.body)
+            MAGIC, int(self.type), FLAG_AUTH if key else 0, len(header_bytes), len(self.body)
         )
         payload = prefix + header_bytes + self.body
+        if key:
+            payload += _hmac.digest(key, payload, "sha256")[:AUTH_TAG_LEN]
         return payload + CRC_STRUCT.pack(zlib.crc32(payload) & 0xFFFFFFFF)
 
 
@@ -153,9 +198,11 @@ _META_REQ = frozenset(
 _DATA_REQ = frozenset({"transfer_id", "seq", "chunk_len"})
 _EOF_REQ = frozenset({"transfer_id", "total_chunks", "sha256", "total_len"})
 _PARITY_REQ = frozenset({"transfer_id", "seq_start", "seq_end"})
+_PARITY_OPT = frozenset({"stride"})
 _STATUS_REQ = frozenset({"transfer_id", "kind", "have", "total_chunks", "missing"})
 _STATUS_OPT = frozenset({"reason", "hmac"})
 _HMAC_OPT = frozenset({"hmac"})
+_META_OPT = frozenset({"hmac", "parity_families"})
 
 
 def check_meta_fields(h: Mapping[str, Any]) -> None:
@@ -169,6 +216,22 @@ def check_meta_fields(h: Mapping[str, Any]) -> None:
     group = _int(h, "parity_group", 0, MAX_PARITY_GROUP)
     if group == 1:
         raise ProtocolError("bad parity_group")
+    if "parity_families" in h:
+        fams = h["parity_families"]
+        if group != 0 or type(fams) is not list or not 1 <= len(fams) <= MAX_PARITY_FAMILIES:
+            raise ProtocolError("bad parity_families")
+        strides = set()
+        for fam in fams:
+            if (
+                type(fam) is not list
+                or len(fam) != 2
+                or any(type(x) is not int for x in fam)
+                or not 2 <= fam[0] <= MAX_PARITY_GROUP
+                or not 1 <= fam[1] <= MAX_PARITY_STRIDE
+                or fam[1] in strides
+            ):
+                raise ProtocolError("bad parity_families")
+            strides.add(fam[1])
     _hex64(h.get("sha256"), "sha256")
     ctype = h.get("content_type")
     if (
@@ -223,7 +286,19 @@ def check_report_fields(
         raise ProtocolError("reason only allowed on fail")
 
 
+_HEARTBEAT_REQ = frozenset({"sender", "seq"})
+_SENDER_RE = re.compile(r"[0-9a-f]{16}")
+
+
 def _check_header(ftype: FrameType, h: Mapping[str, Any], body: bytes) -> None:
+    if ftype is FrameType.HEARTBEAT:
+        _keys(h, _HEARTBEAT_REQ)
+        if type(h["sender"]) is not str or _SENDER_RE.fullmatch(h["sender"]) is None:
+            raise ProtocolError("bad sender")
+        _int(h, "seq", 0, (1 << 53) - 1)
+        if body:
+            raise ProtocolError("HEARTBEAT frame must have an empty body")
+        return
     tid = h.get("transfer_id")
     if not valid_transfer_id(tid):
         raise ProtocolError("bad transfer_id")
@@ -234,16 +309,19 @@ def _check_header(ftype: FrameType, h: Mapping[str, Any], body: bytes) -> None:
             raise ProtocolError("chunk_len does not match body")
         return
     if ftype is FrameType.PARITY:
-        _keys(h, _PARITY_REQ)
+        _keys(h, _PARITY_REQ, _PARITY_OPT)
         start = _int(h, "seq_start", 0, MAX_CHUNKS - 1)
-        _int(h, "seq_end", start, min(start + MAX_PARITY_GROUP - 1, MAX_CHUNKS - 1))
+        stride = _int(h, "stride", 2, MAX_PARITY_STRIDE) if "stride" in h else 1
+        end = _int(h, "seq_end", start, min(start + (MAX_PARITY_GROUP - 1) * stride, MAX_CHUNKS - 1))
+        if (end - start) % stride:
+            raise ProtocolError("seq_end off the parity stride")
         if len(body) > MAX_CHUNK_SIZE:
             raise ProtocolError("parity body too large")
         return
     if body:
         raise ProtocolError(f"{ftype.name} frame must have an empty body")
     if ftype is FrameType.META:
-        _keys(h, _META_REQ, _HMAC_OPT)
+        _keys(h, _META_REQ, _META_OPT)
         check_meta_fields(h)
     elif ftype is FrameType.EOF:
         _keys(h, _EOF_REQ)
@@ -263,23 +341,38 @@ def _no_constant(name: str) -> None:
     raise ValueError(f"non-finite JSON constant {name}")
 
 
-def decode_frame(datagram: bytes) -> Frame:
-    """Parse and fully validate one datagram. Every later stage may trust the result."""
+def decode_frame(datagram: bytes, key: bytes | None = None, require_auth: bool = False) -> Frame:
+    """Parse and fully validate one datagram. Every later stage may trust the result.
+
+    With ``key`` a tagged frame must carry the right tag. With ``require_auth``
+    an untagged frame is refused too; without it, untagged frames pass (mixed
+    rollout) and the caller decides what that is worth.
+    """
     if len(datagram) < HEADER_STRUCT.size + CRC_STRUCT.size:
         raise ProtocolError("datagram too short")
-    magic, ftype, _flags, hlen, blen = HEADER_STRUCT.unpack_from(datagram, 0)
+    magic, ftype, flags, hlen, blen = HEADER_STRUCT.unpack_from(datagram, 0)
     if magic != MAGIC:
         if magic == LEGACY_MAGIC:
             raise ProtocolError("legacy DIO1 peer: wire version DIO2 is required")
         raise ProtocolError(f"bad magic {magic!r}")
-    total = HEADER_STRUCT.size + hlen + blen + CRC_STRUCT.size
+    if flags & ~FLAG_AUTH:
+        raise ProtocolError(f"unknown flags {flags:#x}")
+    tag_len = AUTH_TAG_LEN if flags & FLAG_AUTH else 0
+    end = HEADER_STRUCT.size + hlen + blen
+    total = end + tag_len + CRC_STRUCT.size
     if len(datagram) != total:
         raise ProtocolError(f"length mismatch got={len(datagram)} want={total}")
-    crc_off = HEADER_STRUCT.size + hlen + blen
+    crc_off = end + tag_len
     (want_crc,) = CRC_STRUCT.unpack_from(datagram, crc_off)
     got_crc = zlib.crc32(datagram[:crc_off]) & 0xFFFFFFFF
     if want_crc != got_crc:
         raise ProtocolError("crc mismatch")
+    if tag_len and key is not None:
+        want_tag = _hmac.digest(key, datagram[:end], "sha256")[:AUTH_TAG_LEN]
+        if not _hmac.compare_digest(want_tag, datagram[end:crc_off]):
+            raise FrameAuthError("frame auth tag mismatch")
+    elif require_auth:
+        raise FrameAuthError("frame auth tag missing")
     try:
         t = FrameType(ftype)
     except ValueError as exc:
@@ -293,12 +386,12 @@ def decode_frame(datagram: bytes) -> Frame:
         raise ProtocolError("bad header json") from exc
     if type(header) is not dict:
         raise ProtocolError("header is not a JSON object")
-    body = datagram[HEADER_STRUCT.size + hlen : crc_off]
+    body = datagram[HEADER_STRUCT.size + hlen : end]
     _check_header(t, header, body)
     return Frame(type=t, header=header, body=body)
 
 
-def max_datagram_len(chunk_size: int) -> int:
+def max_datagram_len(chunk_size: int, auth: bool = False) -> int:
     """Largest encoded DATA or PARITY datagram for this chunk size (worst-case header)."""
     tid = "x" * 64
     data = Frame(
@@ -311,7 +404,14 @@ def max_datagram_len(chunk_size: int) -> int:
         {"transfer_id": tid, "seq_start": MAX_CHUNKS - MAX_PARITY_GROUP, "seq_end": MAX_CHUNKS - 1},
         b"\x00" * chunk_size,
     )
-    return max(len(data.encode()), len(parity.encode()))
+    return max(len(data.encode()), len(parity.encode())) + (AUTH_TAG_LEN if auth else 0)
+
+
+def chunk_for_mtu(mtu: int, auth: bool = False) -> int:
+    """Largest chunk whose worst-case datagram fits one IPv4 packet of ``mtu`` (no fragmentation)."""
+    budget = mtu - 28  # IPv4 20 + UDP 8
+    overhead = max_datagram_len(0, auth)
+    return max(1, min(MAX_CHUNK_SIZE, budget - overhead))
 
 
 def sha256_hex(data: bytes) -> str:
@@ -347,6 +447,9 @@ _META_MAC_FIELDS = (
 def meta_hmac(secret: bytes, header: Mapping[str, Any]) -> str:
     """HMAC-SHA256 over every META field that shapes reconstruction (not just the digest)."""
     msg = "DIO2-META|" + "|".join(str(header[k]) for k in _META_MAC_FIELDS)
+    if "parity_families" in header:
+        # Only when set, so senders with plain FEC sign exactly what they always did.
+        msg += "|fam=" + ",".join(f"{g}x{s}" for g, s in header["parity_families"])
     return _hmac.new(secret, msg.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
@@ -476,15 +579,18 @@ def expected_chunk_len(chunk_size: int, last_chunk_len: int, total_chunks: int, 
 
 
 def xor_bytes(parts: list[bytes]) -> bytes:
-    """XOR equal-width byte strings (pad shorter with zeros to max length)."""
+    """XOR byte strings, shorter ones zero-padded to the longest.
+
+    Little-endian big-int XOR: zero padding falls at the high end for free, and
+    the work runs in C instead of a Python loop per byte.
+    """
     if not parts:
         return b""
     width = max(len(p) for p in parts)
-    acc = bytearray(width)
+    acc = 0
     for part in parts:
-        for i, b in enumerate(part):
-            acc[i] ^= b
-    return bytes(acc)
+        acc ^= int.from_bytes(part, "little")
+    return acc.to_bytes(width, "little")
 
 
 def recover_missing_chunk(
@@ -520,7 +626,9 @@ def build_meta_header(
     content_type: str = "application/octet-stream",
     parity_group: int = 0,
     hmac_secret: bytes | None = None,
+    parity_families: "list[tuple[int, int]] | None" = None,
 ) -> dict[str, Any]:
+    """META header. ``parity_families`` replaces ``parity_group`` when set (see meta_families)."""
     header: dict[str, Any] = {
         "transfer_id": transfer_id,
         "total_len": total_len,
@@ -531,6 +639,9 @@ def build_meta_header(
         "last_chunk_len": last_chunk_len,
         "parity_group": parity_group if parity_group > 1 else 0,
     }
+    if parity_families:
+        header["parity_group"] = 0
+        header["parity_families"] = [[g, st] for g, st in parity_families]
     if hmac_secret is not None:
         header["hmac"] = meta_hmac(hmac_secret, header)
     return header
@@ -543,6 +654,7 @@ def build_transfer_frames(
     content_type: str = "application/octet-stream",
     parity_group: int = 0,
     hmac_secret: bytes | None = None,
+    parity_families: "list[tuple[int, int]] | None" = None,
 ) -> list[Frame]:
     """Build META + DATA [+ PARITY] + EOF in memory (tests / small payloads).
 
@@ -566,6 +678,7 @@ def build_transfer_frames(
         content_type=content_type,
         parity_group=parity_group,
         hmac_secret=hmac_secret,
+        parity_families=parity_families,
     )
     meta = Frame(type=FrameType.META, header=header)
     data_frames = [
@@ -582,21 +695,9 @@ def build_transfer_frames(
     ]
     out: list[Frame] = [meta, *data_frames]
 
-    if parity_group > 1:
-        for start in range(0, len(chunks), parity_group):
-            group = list(range(start, min(start + parity_group, len(chunks))))
-            bodies = [chunks[i] for i in group]
-            out.append(
-                Frame(
-                    type=FrameType.PARITY,
-                    header={
-                        "transfer_id": transfer_id,
-                        "seq_start": group[0],
-                        "seq_end": group[-1],
-                    },
-                    body=xor_bytes(bodies),
-                )
-            )
+    for g, st in meta_families(header):
+        for group in parity_groups(len(chunks), g, st):
+            out.append(_parity_frame(transfer_id, group, [chunks[i] for i in group], st))
 
     eof = Frame(
         type=FrameType.EOF,
@@ -638,62 +739,83 @@ def file_transfer_stats(
     return h.hexdigest(), total, chunks, last_len
 
 
+def parity_groups(total_chunks: int, group: int, stride: int = 1) -> Iterator[list[int]]:
+    """Member seqs of every parity group, in send order.
+
+    Chunks go in blocks of group*stride. Group j of a block holds block+j,
+    block+j+stride, ... so neighbouring chunks never share a group.
+    """
+    block = group * stride
+    for base in range(0, total_chunks, block):
+        for j in range(stride):
+            seqs = [s for s in range(base + j, min(base + block, total_chunks), stride)]
+            if seqs:
+                yield seqs
+
+
+def _parity_frame(transfer_id: str, seqs: list[int], bodies: list[bytes], stride: int) -> Frame:
+    header: dict[str, Any] = {"transfer_id": transfer_id, "seq_start": seqs[0], "seq_end": seqs[-1]}
+    if stride > 1:
+        header["stride"] = stride
+    return Frame(type=FrameType.PARITY, header=header, body=xor_bytes(bodies))
+
+
+def meta_families(header: Mapping[str, Any]) -> list[tuple[int, int]]:
+    """Parity families a META declares: plain ``parity_group`` G is one family (G, 1)."""
+    if "parity_families" in header:
+        return [(g, st) for g, st in header["parity_families"]]
+    g = header.get("parity_group", 0)
+    return [(g, 1)] if g > 1 else []
+
+
 def iter_data_and_parity_from_file(
     path: Path,
     transfer_id: str,
     chunk_size: int = DEFAULT_CHUNK_SIZE,
     parity_group: int = 0,
+    parity_families: "list[tuple[int, int]] | None" = None,
 ) -> Iterator[Frame]:
-    """Yield DATA and optional PARITY frames by streaming the file (no full RAM)."""
-    group_seqs: list[int] = []
-    group_bodies: list[bytes] = []
+    """Yield DATA and PARITY frames by streaming the file (no full RAM).
+
+    Each family's parities for a block go out together right after the block.
+    Sending a parity next to its own members would let one burst take both.
+    The sender holds at most the largest block (group*stride chunks) in memory.
+    """
+    fams = list(parity_families or ([(parity_group, 1)] if parity_group > 1 else []))
+    keep = max((g * st for g, st in fams), default=0)
+    bodies: dict[int, bytes] = {}
     seq = 0
-    with path.open("rb") as fh:
-        empty = True
-        while True:
+
+    def flush(g: int, st: int, base: int, end: int) -> Iterator[Frame]:
+        for j in range(st):
+            members = range(base + j, end, st)
+            if members:
+                yield _parity_frame(transfer_id, list(members), [bodies[m] for m in members], st)
+
+    def chunks() -> Iterator[bytes]:
+        with path.open("rb") as fh:
             body = fh.read(chunk_size)
             if not body:
-                break
-            empty = False
-            yield Frame(
-                type=FrameType.DATA,
-                header={
-                    "transfer_id": transfer_id,
-                    "seq": seq,
-                    "chunk_len": len(body),
-                },
-                body=body,
-            )
-            if parity_group > 1:
-                group_seqs.append(seq)
-                group_bodies.append(body)
-                if len(group_bodies) >= parity_group:
-                    yield Frame(
-                        type=FrameType.PARITY,
-                        header={
-                            "transfer_id": transfer_id,
-                            "seq_start": group_seqs[0],
-                            "seq_end": group_seqs[-1],
-                        },
-                        body=xor_bytes(group_bodies),
-                    )
-                    group_seqs.clear()
-                    group_bodies.clear()
+                yield b""  # empty file: one empty chunk
+            while body:
+                yield body
+                body = fh.read(chunk_size)
+
+    for body in chunks():
+        yield Frame(
+            type=FrameType.DATA,
+            header={"transfer_id": transfer_id, "seq": seq, "chunk_len": len(body)},
+            body=body,
+        )
+        if not fams:
             seq += 1
-        if empty:
-            yield Frame(
-                type=FrameType.DATA,
-                header={"transfer_id": transfer_id, "seq": 0, "chunk_len": 0},
-                body=b"",
-            )
-            seq = 1
-        if parity_group > 1 and group_bodies:
-            yield Frame(
-                type=FrameType.PARITY,
-                header={
-                    "transfer_id": transfer_id,
-                    "seq_start": group_seqs[0],
-                    "seq_end": group_seqs[-1],
-                },
-                body=xor_bytes(group_bodies),
-            )
+            continue
+        bodies[seq] = body
+        seq += 1
+        for g, st in fams:
+            if seq % (g * st) == 0:
+                yield from flush(g, st, seq - g * st, seq)
+        bodies.pop(seq - keep, None)  # every open block starts after this seq
+    for g, st in fams:
+        if seq % (g * st):
+            yield from flush(g, st, seq - seq % (g * st), seq)

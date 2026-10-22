@@ -4,6 +4,37 @@
 
 > **Not a security boundary.** This models sequenced UDP + checksums so you can reason about reorder, loss, FEC, quarantine, and multi‑GB transfers. A true data diode is a *physics* one-way link; applications still own integrity (at-least-once assembly). A second, independent one-way stream may carry receipts. A host that both sends and receives is the exfil anti-pattern.
 
+## Run it
+
+The service is one image with two roles (`DIODE_MODE=sender|receiver`), standard-library
+Python only, running as uid 10001 with a read-only root filesystem.
+
+```bash
+# pull a release (linux/amd64 and linux/arm64)
+podman pull ghcr.io/newen-systems/udp-diode:0.1.0     # or docker pull
+
+# or build it yourself
+podman build -t udp-diode .                           # or docker build -t udp-diode .
+
+# end-to-end check of a built image: sender -> UDP -> receiver -> sink, all uid 10001
+ENGINE=podman tests/smoke.sh udp-diode                # ENGINE=docker for Docker
+
+# two-network Compose demo through a one-way relay (COMPOSE picks the engine)
+COMPOSE="podman compose" examples/demo.sh             # default: docker compose
+COMPOSE="podman compose" examples/demo.sh receipts
+
+# Kubernetes (Kustomize): restricted Pod Security, default-deny NetworkPolicy
+kubectl apply -f examples/k8s/namespace.yaml
+(umask 077; mkdir -p keys; for k in api_token data_key; do openssl rand -hex 32 >keys/$k; done)
+kubectl -n udp-diode create secret generic udp-diode-keys --from-file=keys/
+kubectl apply -k examples/k8s
+```
+
+Releases: push a tag `vX.Y.Z` that matches `VERSION`. The `build` workflow builds
+amd64 and arm64 with buildah, smoke-tests with podman, pushes
+`ghcr.io/newen-systems/udp-diode:X.Y.Z` (plus `X.Y`, `X`, `latest`; `main` pushes
+`edge`) and creates the GitHub Release. Pin a digest in production.
+
 ## What you get
 
 | Piece | Role |
@@ -13,7 +44,7 @@
 | `protocol.py` | Wire format (magic `DIO2`): META / DATA / PARITY / EOF / STATUS, strict per-field validation |
 | `receipts.py` | Local receipt JSON (holes / ok / fail). Coordinator language. |
 | `coordinator.py` | Same-side copy of allowlisted receipts. No sockets. |
-| `soft_diode_relay.py` | Optional software one-way hop for local demos |
+| `soft_diode_relay.py` | Software one-way hop; optional seeded loss, bursts, blackout, dup, reorder for tests |
 | `run_demo.sh` | Loopback scenario matrix (publish / quarantine / dual-track ARQ) |
 
 ### Research absorbed
@@ -25,12 +56,16 @@
 | Disk-backed reassembly | Catcher mmap spill above 640 MiB (RAM first) |
 | META/EOF ×N redundancy | `--meta-copies` / `--eof-copies` (default 3) |
 | XOR FEC (1 loss / group) | `--parity-group N` (PARITY + EOF path) |
+| Interleaved multi-family XOR FEC (peeling decoder) | `--parity-families 12x240,12x248,12x256` / `DIODE_FEC_FAMILIES` |
+| Per-frame MAC on every data-track frame | `--frame-auth` / `DIODE_FRAME_AUTH=on` (default) |
+| Signed heartbeat, drop counters by reason, kernel UDP counters | `DIODE_HEARTBEAT_S`, `/v1/stats` |
 | Send bitrate throttle | `--max-bitrate` Mbit/s |
 | Large SO_RCVBUF + drain | Default ~32 MiB + non-blocking queue drain |
 | META HMAC | `--hmac-secret` |
 | Atomic publish + hash gate | `.part` → final + SHA-256 |
 
-**Not included (candidates):** Reed-Solomon multi-loss FEC, jumbo frames E2E, product integrations.
+**Not included (candidates):** Reed-Solomon or RaptorQ, jumbo frames E2E, product integrations.
+What was tried, measured and rejected (and why) is in [`results/ABSORB-RESEARCH.md`](results/ABSORB-RESEARCH.md).
 
 ## Quick start
 
@@ -77,6 +112,16 @@ python3 soft_diode_relay.py --listen-port 9401 --forward-port 9400
 python3 pitcher.py /tmp/blob --host 127.0.0.1 --port 9401
 ```
 
+Impair the hop for tests that cannot use `tc netem` (macOS, CI without root).
+Loss is a two-state burst model: `--loss` is the long-run rate, `--burst` the
+mean run of drops. Seed it for repeatable runs; run a second relay to impair
+the receipt direction too.
+
+```bash
+python3 soft_diode_relay.py --listen-port 9401 --forward-port 9400 \
+  --loss 0.03 --burst 6 --blackout 2:1.5 --dup 0.01 --reorder 0.01 --seed 7 --stats-file /tmp/relay.json
+```
+
 ## WAN recommended profile (speed vs assurance)
 
 Measured on a ~10 ms RTT bidirectional site VPN (not optical diode). Full table: [`results/WAN-BALANCE.md`](results/WAN-BALANCE.md).
@@ -87,6 +132,9 @@ Measured on a ~10 ms RTT bidirectional site VPN (not optical diode). Full tabl
 | **256 MiB** | `--max-bitrate 15 --passes 2 …` | **~4.1 Mbit/s** |
 | **512 MiB** | `--max-bitrate 12 --passes 2 …` | **~3.4 Mbit/s** |
 | Speed best-effort | `--max-bitrate 18 --passes 1 …` | ~9.4 when lucky — **flaky integrity** |
+| **Families, one pass (container, VPN, 2026-10-23)** | `DIODE_PASSES=1 DIODE_FEC_FAMILIES=12x240,12x248,12x256 DIODE_PARITY_GROUP=0 DIODE_MAX_BITRATE_MBPS=95` | **~68.8 Mbit/s**, 14/14 at the sink, 64-512 MiB |
+
+Families row: feedback off, 1250-byte chunks with frame auth at MTU 1432. Two passes with no parity on the same path and day gave 43.9 Mbit/s. Strides of 64 to 80 failed 2 of 7 at 256 MiB: one VPN loss burst was longer than the stride. See [`results/ABSORB-RESEARCH.md`](results/ABSORB-RESEARCH.md).
 
 **Takeaway:** dual-pass is the knee. Single-pass is faster but not for custody. Third pass is usually diminishing returns once dual-pass + FEC + catcher buffering hold. Unthrottled blasts self-inflict severe loss.
 
@@ -98,6 +146,8 @@ Measured on a ~10 ms RTT bidirectional site VPN (not optical diode). Full tabl
 | `--reorder` | Shuffle DATA (memory path / small files) |
 | `--corrupt` / `--wire-corrupt` | Integrity / CRC demos |
 | `--parity-group N` | XOR FEC every N DATA chunks |
+| `--parity-families GxS,...` | Interleaved XOR families instead of `--parity-group` (catcher reads them from META) |
+| `--frame-auth` | MAC every frame with a key derived from `--hmac-secret` |
 | `--passes N` | Full envelope retransmit N times (data-track redundancy) |
 | `--send-receipts DIR` | Validate track: send STATUS from a receipt inbox (send-only) |
 | `--watch-receipts DIR` | Data track: poll local inbox for holes/ok/fail and resend |
@@ -127,6 +177,7 @@ Measured on a ~10 ms RTT bidirectional site VPN (not optical diode). Full tabl
 | `--ram-max-bytes N` | Assemble at or above this size in an mmap work file |
 | `--min-free-bytes N` | Refuse a transfer that would leave less free on the output volume |
 | `--holes-window N` | Missing sequence numbers per holes receipt (default 64, max 128) |
+| `--require-frame-auth` | Drop any data-track frame without a valid MAC from `--hmac-secret` |
 
 ## Dual track (data ↑, validate ↓)
 
@@ -256,7 +307,7 @@ HTTP API (bearer token from `DIODE_API_TOKEN_FILE`, except `/healthz` and `/read
 |---|---|
 | `POST /v1/transfers` on the sender, header `Idempotency-Key` (1-128 of `A-Za-z0-9._:-`), body streamed (Content-Length or chunked) | `202` `{id,state,size,sha256,...}` after the payload and ledger row are durable. Same key and bytes: `202` again with `Idempotent-Replay: true`. Same key, other bytes: `409`. `400` bad key/framing, `401`, `411`, `413`, `408` read timeout, `503` too many uploads (`Retry-After`), `507` disk reserve or spool quota. |
 | `GET /v1/transfers/{id}` on the sender | Local state only: `queued`, `sending`, `sent-unconfirmed` (feedback off), `receiver-verified` (feedback on), `failed`, `expired`. `receiver_confirmed` is true only for `receiver-verified`. |
-| `GET /v1/stats` | Queue bytes, oldest age, accepted/verified/failed, retry bytes, downstream failures, disk free. Feedback off reports nothing about the far side. |
+| `GET /v1/stats` | Queue bytes, oldest age, accepted/verified/failed, retry bytes, downstream failures, disk free. Receiver also: `drops` by reason (`crc`, `auth`, `length`, `schema`, ...), `kernel_udp` (`rcvbuf_errors`, `softnet_dropped`, Linux only), granted `rcvbuf_bytes`, heartbeat age and gaps. Feedback off reports nothing about the far side. |
 | `GET /healthz`, `GET /readyz` | Liveness; readiness (spool writable and above reserve, ledger open, workers running). |
 | `GET /v1/deliveries/{id}`, `POST /v1/deliveries/{id}/retry` on the receiver | Delivery state; requeue a parked delivery. |
 
@@ -296,9 +347,12 @@ Transport tuning (all validated; defaults in brackets):
 | Variable | Default | Effect |
 |---|---|---|
 | `DIODE_MAX_BITRATE_MBPS` | 100 | Sender pacing, Mbit/s of wire bytes, shared by all jobs and resends |
-| `DIODE_CHUNK_SIZE` | 1200 | DATA body bytes; rejected if the worst-case datagram exceeds `DIODE_MTU - 28` |
+| `DIODE_CHUNK_SIZE` | 1200 | DATA body bytes; rejected if the worst-case datagram exceeds `DIODE_MTU - 28`. `auto`: the largest that fits `DIODE_MTU` |
 | `DIODE_MTU` | 1500 | Path MTU the frame budget is checked against |
 | `DIODE_PARITY_GROUP` | 0 | XOR FEC group size (0 off, 2 and up) |
+| `DIODE_FEC_FAMILIES` | unset | Interleaved XOR families `GxS,...` instead of `DIODE_PARITY_GROUP`, e.g. `12x240,12x248,12x256` (about 1.37x wire with headers). See `results/ABSORB-RESEARCH.md` |
+| `DIODE_FRAME_AUTH` | on | Both roles. `on`: every data-track frame carries a 16-byte MAC and the receiver drops untagged or forged frames. Must match on both sides |
+| `DIODE_HEARTBEAT_S` | 5 | Sender sends a sequenced HEARTBEAT this often (0 off). Receiver `/v1/stats` shows `last_heartbeat_age_s` and `heartbeats_missed` |
 | `DIODE_META_COPIES`, `DIODE_EOF_COPIES` | 3, 3 | Control-frame redundancy |
 | `DIODE_PASSES` | 1 | Full passes before waiting for receipts / marking sent-unconfirmed |
 | `DIODE_GAP_MS` | 0 | Minimum inter-datagram gap |
@@ -335,8 +389,8 @@ front of it or set the TLS variables.
 ## Container image and Compose demo
 
 ```bash
-docker build -t udp-diode:dev .                                        # linux/arm64 or amd64, the host's
-docker buildx build --platform linux/amd64 -t udp-diode:dev-amd64 --load .   # cross-build, needs amd64 emulation
+podman build -t udp-diode:dev .                                        # or docker build; the host's arch
+podman build --platform linux/amd64 -t udp-diode:dev-amd64 .           # cross-build, needs qemu-user-static
 examples/demo.sh             # strict one-way: 50 MiB and 1 KiB through sender -> relay -> receiver -> sink
 examples/demo.sh receipts    # the same with restricted receipts
 ```
@@ -354,3 +408,35 @@ keys under `examples/secrets/` (ignored by git). On a single Docker host this
 shows function, not isolation; use separate hosts or networks with firewall
 policy for a real boundary. The receiver asks for a 32 MiB receive buffer and
 the kernel caps it (`net.core.rmem_max`); raise it on the host for fast links.
+
+## Security
+
+Reviewed for the 0.1.0 release (code, image, Compose and Kubernetes examples). No
+critical or high finding in the service's default configuration: frame auth is on, the
+data key is required, every frame tag is checked before parsing, and the META HMAC and
+whole-object SHA-256 are checked before anything is published. Paths are built only
+from validated ids, and secrets and tokens are compared in constant time.
+
+Fixed for 0.1.0:
+- The standalone `catcher.py` binds `127.0.0.1` by default and refuses a non-loopback
+  bind without `--hmac-secret` unless `--insecure` is passed.
+- Secret files with control characters are refused at startup, and the receiver logs
+  only the delivery host, never URL credentials.
+- `DIODE_FRAME_AUTH=off` logs a warning at startup.
+- The demo and smoke scripts pass the bearer token in a header file, not on the command line.
+
+Known limits (by design or open):
+- With `DIODE_FRAME_AUTH=off`, one forged datagram can block a transfer, and forged
+  DATA for random ids can fill the active-assembly slots. Content is still never
+  published unless it verifies. Keep frame auth on unless the path is trusted.
+- A captured transfer replayed after `DIODE_DEDUPE_RETENTION_S` (7 days) is delivered
+  again under the same `Idempotency-Key`. Destinations should deduplicate on it.
+- The HTTP API is plaintext unless `DIODE_TLS_CERT_FILE`/`DIODE_TLS_KEY_FILE` are set.
+  Terminate TLS in front of it or set them.
+- The spool quota is checked against Content-Length. A chunked upload is bounded only by
+  the disk reserve. Only authenticated clients can upload.
+- Receipts carry no nonce: an old receipt replayed on the high-to-low path is bounded by
+  the receipt retention window and the active-job binding.
+- The image is not signed. Pin by digest.
+- `net.core.rmem_max` is a host setting. Kubernetes cannot raise it per pod, so size it on
+  the receiver's nodes for fast links.

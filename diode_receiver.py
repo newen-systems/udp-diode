@@ -29,7 +29,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 import pitcher
-from catcher import Catcher, _configure_recv_buf
+from catcher import Catcher, _configure_recv_buf, kernel_udp_counters
 from diode_config import Config
 from diode_http import (
     BoundedServer,
@@ -39,7 +39,7 @@ from diode_http import (
     make_ssl_context,
     serve_in_thread,
 )
-from protocol import valid_transfer_id
+from protocol import frame_key, valid_transfer_id
 from receipts import ReceiptStore
 
 RETRYABLE = {408, 425, 429}
@@ -176,7 +176,12 @@ class ReceiverService:
             min_free_bytes=cfg.min_free_bytes,
             holes_window=cfg.holes_window,
             ram_budget_bytes=cfg.ram_budget_bytes,
+            frame_key=frame_key(cfg.data_key) if cfg.frame_auth else None,
+            require_frame_auth=cfg.frame_auth,
         )
+        if not cfg.frame_auth:
+            print("warn: DIODE_FRAME_AUTH=off: one forged datagram can block a transfer; "
+                  "only use it on a trusted path", file=sys.stderr)
         self.rcpt_store: ReceiptStore | None = None
         self.rcpt_sock: socket.socket | None = None
         self.emitter: pitcher.ReceiptEmitter | None = None
@@ -198,7 +203,7 @@ class ReceiverService:
         self._reconcile()
 
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        _configure_recv_buf(self.sock, cfg.chunk_size + 256, want=cfg.rcvbuf)
+        self.rcvbuf = _configure_recv_buf(self.sock, cfg.chunk_size + 256, want=cfg.rcvbuf)
         self.sock.bind(cfg.data_bind)
         self.sock.settimeout(0.2)
 
@@ -391,6 +396,16 @@ class ReceiverService:
             "retry_bytes": None,
             "receipts_written": c["receipts_written"],
             "disk_free_bytes": self.disk_free(),
+            "drops": dict(self.catcher.drops),
+            "frame_auth": self.cfg.frame_auth,
+            "rcvbuf_bytes": self.rcvbuf,
+            "kernel_udp": kernel_udp_counters(),
+            "heartbeats": c["heartbeats"],
+            "heartbeats_missed": c["heartbeats_missed"],
+            "last_heartbeat_age_s": (
+                None if self.catcher.heartbeat_at is None
+                else round(time.monotonic() - self.catcher.heartbeat_at, 1)
+            ),
         }
 
     # ------------------------------------------------------------ lifecycle
@@ -424,7 +439,7 @@ class ReceiverService:
         self.threads.append(serve_in_thread(self.server, "http"))
         print(
             f"receiver up udp={cfg.data_bind[0]}:{cfg.data_bind[1]} http={cfg.http_bind}:{cfg.http_port} "
-            f"feedback={cfg.feedback} delivery={cfg.delivery_url}",
+            f"feedback={cfg.feedback} delivery={urlsplit(cfg.delivery_url).hostname}",  # never log URL userinfo or query
             file=sys.stderr,
         )
 

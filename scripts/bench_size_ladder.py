@@ -111,6 +111,8 @@ def main() -> int:
         ]
         if args.hmac_secret:
             catcher_cmd.extend(["--hmac-secret", args.hmac_secret])
+        else:
+            catcher_cmd.append("--insecure")
 
         # When host is remote, this script runs only on catcher side for stats —
         # full cross-site is driven by shell. Local mode runs both.

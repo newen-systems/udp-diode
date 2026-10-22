@@ -11,10 +11,20 @@ from pathlib import Path
 from typing import Mapping
 from urllib.parse import urlsplit
 
-from protocol import DEFAULT_CHUNK_SIZE, MAX_CHUNK_SIZE, MAX_PARITY_GROUP, STATUS_MISSING_MAX, max_datagram_len
+from protocol import (
+    DEFAULT_CHUNK_SIZE,
+    MAX_CHUNK_SIZE,
+    MAX_PARITY_GROUP,
+    MAX_PARITY_FAMILIES,
+    MAX_PARITY_STRIDE,
+    STATUS_MISSING_MAX,
+    chunk_for_mtu,
+    max_datagram_len,
+)
 
 MODES = ("sender", "receiver")
 FEEDBACK = ("off", "receipts")
+ONOFF = ("on", "off")
 GiB = 1024**3
 MiB = 1024**2
 
@@ -39,6 +49,7 @@ class Config:
     mtu: int = 1500
     chunk_size: int = DEFAULT_CHUNK_SIZE
     holes_window: int = 64
+    frame_auth: bool = True
     # http limits
     http_io_timeout_s: float = 30.0
     header_deadline_s: float = 10.0
@@ -49,6 +60,8 @@ class Config:
     receipt_bind: tuple[str, int] = ("0.0.0.0", 9401)
     max_bitrate_mbps: float = 100.0
     parity_group: int = 0
+    parity_families: tuple[tuple[int, int], ...] = ()
+    heartbeat_s: float = 5.0
     meta_copies: int = 3
     eof_copies: int = 3
     passes: int = 1
@@ -171,7 +184,33 @@ class _Reader:
         if len(data) < 16:
             self.errors.append(f"{name}: secret in {value} must be at least 16 bytes")
             return None
+        if any(b < 0x20 or b == 0x7F for b in data):
+            # A token with a CR/LF inside would end up in an http.client error message.
+            self.errors.append(f"{name}: secret in {value} contains control characters")
+            return None
         return data
+
+    def families(self, name: str) -> tuple[tuple[int, int], ...]:
+        """'12x64,12x72,12x80': interleaved XOR parity families (group x stride), distinct strides."""
+        value = self._raw(name)
+        if value is None:
+            return ()
+        try:
+            fams = tuple(tuple(int(x) for x in part.split("x")) for part in value.split(","))
+            ok = (
+                1 <= len(fams) <= MAX_PARITY_FAMILIES
+                and all(len(f) == 2 and 2 <= f[0] <= MAX_PARITY_GROUP and 1 <= f[1] <= MAX_PARITY_STRIDE for f in fams)
+                and len({f[1] for f in fams}) == len(fams)
+            )
+        except ValueError:
+            ok = False
+        if not ok:
+            self.errors.append(
+                f"{name}={value!r} must be 1-{MAX_PARITY_FAMILIES} GxS pairs, G 2-{MAX_PARITY_GROUP}, "
+                f"S 1-{MAX_PARITY_STRIDE}, distinct S (e.g. 12x64,12x72,12x80)"
+            )
+            return ()
+        return fams  # type: ignore[return-value]
 
     def path(self, name: str, required: bool = False) -> Path | None:
         value = self._raw(name)
@@ -209,14 +248,18 @@ def load(env: Mapping[str, str] | None = None) -> Config:
         r.errors.append("DIODE_RECEIPT_KEY_FILE is set but DIODE_FEEDBACK=off")
 
     mtu = r.int_("DIODE_MTU", 1500, 576, 9216)
-    chunk = r.int_("DIODE_CHUNK_SIZE", DEFAULT_CHUNK_SIZE, 64, MAX_CHUNK_SIZE)
+    frame_auth = r.text("DIODE_FRAME_AUTH", "on", ONOFF) == "on"
+    if r._raw("DIODE_CHUNK_SIZE") == "auto":
+        chunk = chunk_for_mtu(mtu, frame_auth)  # largest chunk that fits DIODE_MTU unfragmented
+    else:
+        chunk = r.int_("DIODE_CHUNK_SIZE", DEFAULT_CHUNK_SIZE, 64, MAX_CHUNK_SIZE)
     holes = r.int_("DIODE_HOLES_WINDOW", 64, 1, STATUS_MISSING_MAX)
     parity = r.int_("DIODE_PARITY_GROUP", 0, 0, MAX_PARITY_GROUP)
     if parity == 1:
         r.errors.append("DIODE_PARITY_GROUP=1 is meaningless; use 0 (off) or 2 and up")
-    if max_datagram_len(chunk) > mtu - 28:
+    if max_datagram_len(chunk, frame_auth) > mtu - 28:
         r.errors.append(
-            f"DIODE_CHUNK_SIZE={chunk} makes a {max_datagram_len(chunk)} byte datagram; "
+            f"DIODE_CHUNK_SIZE={chunk} makes a {max_datagram_len(chunk, frame_auth)} byte datagram; "
             f"DIODE_MTU={mtu} allows {mtu - 28}. Lower the chunk size (never rely on IP fragmentation)"
         )
 
@@ -241,6 +284,7 @@ def load(env: Mapping[str, str] | None = None) -> Config:
         mtu=mtu,
         chunk_size=chunk,
         holes_window=holes,
+        frame_auth=frame_auth,
         http_io_timeout_s=r.number("DIODE_HTTP_IO_TIMEOUT_S", 30.0, 1, 600),
         header_deadline_s=r.number("DIODE_HEADER_DEADLINE_S", 10.0, 1, 600),
         upload_deadline_s=r.number("DIODE_UPLOAD_DEADLINE_S", 3600.0, 5, 86400),
@@ -257,6 +301,8 @@ def load(env: Mapping[str, str] | None = None) -> Config:
             receipt_bind=rbind or ("0.0.0.0", 9401),
             max_bitrate_mbps=r.number("DIODE_MAX_BITRATE_MBPS", 100.0, 0.001, 100000),
             parity_group=parity,
+            parity_families=r.families("DIODE_FEC_FAMILIES"),
+            heartbeat_s=r.number("DIODE_HEARTBEAT_S", 5.0, 0, 3600),
             meta_copies=r.int_("DIODE_META_COPIES", 3, 1, 20),
             eof_copies=r.int_("DIODE_EOF_COPIES", 3, 1, 20),
             passes=r.int_("DIODE_PASSES", 1, 1, 20),
@@ -275,6 +321,8 @@ def load(env: Mapping[str, str] | None = None) -> Config:
             failed_retention_s=r.number("DIODE_FAILED_RETENTION_S", 7 * 86400.0, 1, 365 * 86400),
             ledger_retention_s=r.number("DIODE_LEDGER_RETENTION_S", 30 * 86400.0, 1, 3650 * 86400),
         )
+        if kw["parity_families"] and parity:
+            r.errors.append("set DIODE_PARITY_GROUP or DIODE_FEC_FAMILIES, not both")
         if not receipts and (r._raw("DIODE_RECEIPT_BIND")):
             r.errors.append("DIODE_RECEIPT_BIND is set but DIODE_FEEDBACK=off (no receipt socket is opened)")
     if receiver:

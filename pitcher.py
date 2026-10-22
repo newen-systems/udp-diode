@@ -15,6 +15,7 @@ Absorbs industry practice (godiode / UDPcast / svenseeberg):
 from __future__ import annotations
 
 import argparse
+import os
 import random
 import socket
 import sys
@@ -37,8 +38,10 @@ from protocol import (  # noqa: I001
     build_status_frame,
     build_transfer_frames,
     file_transfer_stats,
+    frame_key,
     iter_data_and_parity_from_file,
     iter_data_seqs_from_file,
+    meta_families,
 )
 from receipts import ReceiptStore, read_source_map, write_source_map
 
@@ -72,6 +75,17 @@ class Pacer:
             time.sleep(delay)
 
 
+def parse_families(text: str) -> list[tuple[int, int]]:
+    """'12x64,12x72' -> [(12, 64), (12, 72)]. Limits are checked by the META schema."""
+    try:
+        fams = [tuple(int(x) for x in part.split("x")) for part in text.split(",") if part.strip()]
+    except ValueError:
+        raise ValueError(f"bad parity families {text!r}: want GxS[,GxS...]") from None
+    if not fams or any(len(f) != 2 for f in fams):
+        raise ValueError(f"bad parity families {text!r}: want GxS[,GxS...]")
+    return fams  # type: ignore[return-value]
+
+
 def _configure_send_buf(sock: socket.socket, packet_size: int) -> None:
     """godiode lesson: enlarge send buffer for burst pacing."""
     want = max(256 * 1024, 64 * packet_size)
@@ -88,8 +102,9 @@ def _send_frame(
     gap_s: float,
     max_bps: float,
     pacer: Pacer | None = None,
+    key: bytes | None = None,
 ) -> int:
-    wire = fr.encode()
+    wire = fr.encode(key)
     sock.sendto(wire, dest)
     if pacer is not None:
         pacer.wait(len(wire))
@@ -244,6 +259,8 @@ class ArqJob:
     # ``have`` count fell, or most of the object never arrived). Bounded.
     repass: "Callable[[], None] | None" = None
     max_repasses: int = 3
+    # Per-frame auth key (protocol.frame_key), or None for untagged frames.
+    frame_key: bytes | None = None
 
 
 def _read_valid_receipt(job: ArqJob):
@@ -287,7 +304,7 @@ def watch_receipts_and_resend(
     """
 
     def send(fr: Frame) -> None:
-        _send_frame(sock, dest, fr, job.gap_s, job.max_bps, job.pacer)
+        _send_frame(sock, dest, fr, job.gap_s, job.max_bps, job.pacer, job.frame_key)
 
     wait = job.timeout_s
     last_token = ""
@@ -388,6 +405,7 @@ def prepare_transfer(
     parity_group: int = 0,
     hmac_secret: bytes | None = None,
     content_type: str = "application/octet-stream",
+    parity_families: "list[tuple[int, int]] | None" = None,
 ) -> Prepared:
     """Hash the file once and build its META and EOF frames."""
     digest, total_len, total_chunks, last_len = file_transfer_stats(path, chunk_size)
@@ -403,6 +421,7 @@ def prepare_transfer(
             content_type=content_type,
             parity_group=parity_group,
             hmac_secret=hmac_secret,
+            parity_families=parity_families,
         ),
     )
     eof = Frame(
@@ -429,18 +448,51 @@ def send_pass(
     eof_copies: int = 3,
     pacer: Pacer | None = None,
     stop: threading.Event | None = None,
+    key: bytes | None = None,
 ) -> bool:
     """One full pass: META xN, DATA (+PARITY) streamed from the file, EOF xN. False if stopped."""
     tid = prepared.meta.header["transfer_id"]
     for _ in range(meta_copies):
-        _send_frame(sock, dest, prepared.meta, 0.0, 0.0, pacer)
-    for n, fr in enumerate(iter_data_and_parity_from_file(path, tid, chunk_size, parity_group)):
+        _send_frame(sock, dest, prepared.meta, 0.0, 0.0, pacer, key)
+    frames = iter_data_and_parity_from_file(
+        path, tid, chunk_size, parity_families=meta_families(prepared.meta.header)
+    )
+    for n, fr in enumerate(frames):
         if stop is not None and n % 256 == 0 and stop.is_set():
             return False
-        _send_frame(sock, dest, fr, 0.0, 0.0, pacer)
+        _send_frame(sock, dest, fr, 0.0, 0.0, pacer, key)
     for _ in range(eof_copies):
-        _send_frame(sock, dest, prepared.eof, 0.0, 0.0, pacer)
+        _send_frame(sock, dest, prepared.eof, 0.0, 0.0, pacer, key)
     return True
+
+
+class Heartbeat:
+    """Send a small sequenced HEARTBEAT every ``interval_s`` so the receiver can tell the link is up.
+
+    The sender id is random per process; the receiver uses sequence gaps to
+    count lost heartbeats. Tagged with the frame key when frame auth is on.
+    """
+
+    def __init__(
+        self, sock: socket.socket, dest: tuple[str, int], interval_s: float, key: bytes | None = None
+    ) -> None:
+        self.sock, self.dest, self.interval_s, self.key = sock, dest, interval_s, key
+        self.sender = os.urandom(8).hex()
+        self.seq = 0
+
+    def beat(self) -> None:
+        fr = Frame(FrameType.HEARTBEAT, {"sender": self.sender, "seq": self.seq})
+        self.seq += 1
+        try:
+            self.sock.sendto(fr.encode(self.key), self.dest)
+        except OSError as exc:
+            print(f"heartbeat send failed: {exc}", file=sys.stderr)
+
+    def run(self, stop: threading.Event) -> None:
+        while True:
+            self.beat()
+            if stop.wait(self.interval_s):
+                return
 
 
 def main() -> int:
@@ -484,6 +536,18 @@ def main() -> int:
         type=int,
         default=0,
         help="XOR FEC group size (>1 enables PARITY frames; recover 1 loss per group)",
+    )
+    p.add_argument(
+        "--parity-families",
+        type=parse_families,
+        default=None,
+        metavar="GxS,GxS",
+        help="Interleaved XOR parity families, e.g. 12x64,12x72,12x80 (replaces --parity-group)",
+    )
+    p.add_argument(
+        "--frame-auth",
+        action="store_true",
+        help="Tag every data-track frame with a MAC from --hmac-secret (catcher: --require-frame-auth)",
     )
     p.add_argument(
         "--drop-seq",
@@ -577,6 +641,13 @@ def main() -> int:
 
     transfer_id = args.transfer_id or str(uuid.uuid4())
     secret = args.hmac_secret.encode("utf-8") if args.hmac_secret else None
+    if args.parity_families and args.parity_group:
+        print("use --parity-group or --parity-families, not both", file=sys.stderr)
+        return 2
+    if args.frame_auth and secret is None:
+        print("--frame-auth needs --hmac-secret", file=sys.stderr)
+        return 2
+    fkey = frame_key(secret) if args.frame_auth and secret else None
     if args.source_map is not None:
         write_source_map(
             args.source_map,
@@ -597,7 +668,7 @@ def main() -> int:
 
     def _send(fr: Frame) -> None:
         nonlocal sent, wire_corrupt_done, data_bytes_sent, next_progress
-        wire = fr.encode()
+        wire = fr.encode(fkey)
         if args.wire_corrupt and not wire_corrupt_done and fr.type == FrameType.DATA:
             wire = bytearray(wire)
             wire[-5] ^= 0xFF
@@ -627,6 +698,7 @@ def main() -> int:
             chunk_size=args.chunk_size,
             parity_group=args.parity_group,
             hmac_secret=secret,
+            parity_families=args.parity_families,
         )
         meta = next(f for f in frames if f.type is FrameType.META)
         data = [f for f in frames if f.type is FrameType.DATA]
@@ -684,6 +756,7 @@ def main() -> int:
                 last_len,
                 parity_group=args.parity_group,
                 hmac_secret=secret,
+                parity_families=args.parity_families,
             ),
         )
         eof = Frame(
@@ -707,7 +780,7 @@ def main() -> int:
                 _send(meta)
             parity_count = 0
             for fr in iter_data_and_parity_from_file(
-                path, transfer_id, args.chunk_size, args.parity_group
+                path, transfer_id, args.chunk_size, args.parity_group, args.parity_families
             ):
                 if fr.type is FrameType.DATA:
                     seq = int(fr.header["seq"])
@@ -760,6 +833,7 @@ def main() -> int:
                 max_bps=max_bps,
                 meta_copies=args.meta_copies,
                 eof_copies=args.eof_copies,
+                frame_key=fkey,
             ),
         )
         sock.close()

@@ -9,7 +9,7 @@
 # networks with firewall policy are needed for that.
 #
 #   examples/make-secrets.sh
-#   DOCKER_CONTEXT=colima docker compose -f examples/compose.yml up -d --build --wait
+#   docker compose -f examples/compose.yml up -d --build --wait     (or podman compose)
 #   examples/demo.sh            # or demo.sh receipts
 name: udp-diode-demo
 
@@ -70,7 +70,7 @@ services:
     image: udp-diode:dev
     build: {context: .., dockerfile: Dockerfile}
     entrypoint: ["python", "/sink.py"]
-    volumes: ["./sink.py:/sink.py:ro"]
+    volumes: ["./k8s/sink.py:/sink.py:ro"]
     read_only: true
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]

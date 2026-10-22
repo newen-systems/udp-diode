@@ -43,7 +43,10 @@ from protocol import (
     ProtocolError,
     StatusReport,
     decode_frame,
+    drop_reason,
     expected_chunk_len,
+    frame_key,
+    meta_families,
     recover_missing_chunk,
     status_report_from_frame,
     valid_transfer_id,
@@ -104,7 +107,8 @@ class Assembly:
     sha256: str | None = None
     chunk_size: int = DEFAULT_CHUNK_SIZE
     last_chunk_len: int = 0
-    parity_group: int = 0
+    # (group, stride) per parity family; see protocol.meta_families
+    families: list[tuple[int, int]] = field(default_factory=list)
     # RAM path
     chunks: dict[int, bytes] | None = field(default_factory=dict)
     # Disk path: one mmap'd file + presence bitmap (avoids seek-per-packet)
@@ -112,7 +116,7 @@ class Assembly:
     data_path: Path | None = None
     present: array | None = None  # 'B' 0/1 per seq
     have: int = 0
-    # keyed by (seq_start, seq_end)
+    # keyed by (seq_start, seq_end, stride)
     parities: dict[tuple[int, int], dict] = field(default_factory=dict)
     first_seen: float = field(default_factory=time.time)
     last_seen: float = field(default_factory=time.time)
@@ -239,8 +243,13 @@ class Catcher:
         min_free_bytes: int = 0,
         holes_window: int = STATUS_MISSING_CAP,
         ram_budget_bytes: int | None = None,
+        frame_key: bytes | None = None,
+        require_frame_auth: bool = False,
     ) -> None:
         self.out_dir = out_dir
+        # Per-frame auth (protocol.frame_key). Required: untagged frames are dropped too.
+        self.frame_key = frame_key
+        self.require_frame_auth = require_frame_auth
         self.quarantine_dir = quarantine_dir
         self.ttl_s = ttl_s
         self.idle_exit_s = idle_exit_s
@@ -285,7 +294,15 @@ class Catcher:
             "status_unbound": 0,
             "status_stale": 0,
             "status_dup": 0,
+            "heartbeats": 0,
+            "heartbeats_missed": 0,
+            "heartbeat_replays": 0,
         }
+        # Every datagram refused at decode, by reason (crc, auth, length, schema, ...).
+        self.drops: dict[str, int] = {}
+        self.heartbeat_sender = ""
+        self.heartbeat_seq = -1
+        self.heartbeat_at: float | None = None  # time.monotonic() of the last good heartbeat
         self.out_dir.mkdir(parents=True, exist_ok=True)
         self.quarantine_dir.mkdir(parents=True, exist_ok=True)
         self.work_dir.mkdir(parents=True, exist_ok=True)
@@ -380,15 +397,21 @@ class Catcher:
     def _handle(self, data: bytes) -> None:
         self.stats["datagrams"] += 1
         try:
-            frame = decode_frame(data)
+            frame = decode_frame(data, self.frame_key, self.require_frame_auth)
         except ProtocolError as exc:
-            self.stats["crc_fail"] += 1
-            if "legacy DIO1" in str(exc):
+            self.stats["crc_fail"] += 1  # every decode refusal; ``drops`` has the breakdown
+            reason = drop_reason(exc)
+            self.drops[reason] = self.drops.get(reason, 0) + 1
+            if reason == "legacy":
                 self.stats["legacy_peer"] += 1
             if self.stats["crc_fail"] <= 5 or self.stats["crc_fail"] % 500 == 0:
                 print(f"drop: {exc}", file=sys.stderr)
             return
 
+        if frame.type is FrameType.HEARTBEAT:
+            if not self.status_only:
+                self._on_heartbeat(frame.header)
+            return
         if self.status_only:
             if frame.type is not FrameType.STATUS:
                 self.stats["status_ignored"] += 1
@@ -447,11 +470,15 @@ class Catcher:
                 if len(asm.parities) >= PREMETA_MAX_PARITIES:
                     self.stats["premeta_dropped"] += 1
                     return
-            elif not self._parity_ok(asm, start, end, len(frame.body)):
+            elif not self._parity_ok(asm, start, end, len(frame.body), frame.header.get("stride", 1)):
                 self.stats["parity_rejected"] += 1
                 return
-            key = (start, end)
-            asm.parities[key] = {"group_seqs": list(range(start, end + 1)), "body": frame.body}
+            stride = frame.header.get("stride", 1)
+            key = (start, end, stride)
+            asm.parities[key] = {
+                "group_seqs": list(range(start, end + 1, stride)),
+                "body": frame.body,
+            }
             if asm.meta is not None:
                 self._try_fec_group(asm, key)
 
@@ -474,16 +501,25 @@ class Catcher:
     # ---------------------------------------------------------------- META
 
     @staticmethod
-    def _parity_ok(asm: Assembly, start: int, end: int, body_len: int) -> bool:
-        pg = asm.parity_group
+    def _group_key(asm: Assembly, group: int, stride: int, seq: int) -> tuple[int, int, int]:
+        """Key of the one group in family (group, stride) that holds ``seq``."""
         total = asm.total_chunks or 0
-        return (
-            pg >= 2
-            and start % pg == 0
-            and end == min(start + pg - 1, total - 1)
-            and end < total
-            and body_len <= asm.chunk_size
-        )
+        block = group * stride
+        base = seq - seq % block
+        start = base + (seq - base) % stride
+        last = start + (group - 1) * stride
+        while last >= min(base + block, total):
+            last -= stride
+        return (start, last, stride)
+
+    @classmethod
+    def _parity_ok(cls, asm: Assembly, start: int, end: int, body_len: int, stride: int = 1) -> bool:
+        """The group must be exactly one that META's geometry defines (see protocol.parity_groups)."""
+        group = {st: g for g, st in asm.families}.get(stride)
+        total = asm.total_chunks or 0
+        if group is None or end >= total or body_len > asm.chunk_size:
+            return False
+        return cls._group_key(asm, group, stride, start) == (start, end, stride)
 
     def _on_meta(self, tid: str, frame) -> None:
         self.stats["meta_frames"] += 1
@@ -498,6 +534,7 @@ class Catcher:
             self._record_rejected(tid, h, "hmac")
             return
         fields = {k: h[k] for k in _META_KEYS}
+        fields["parity_families"] = h.get("parity_families")
         asm = self._asm(tid)
         if asm is None or asm.failed:
             return
@@ -512,7 +549,7 @@ class Catcher:
         asm.sha256 = fields["sha256"]
         asm.chunk_size = fields["chunk_size"]
         asm.last_chunk_len = fields["last_chunk_len"]
-        asm.parity_group = fields["parity_group"]
+        asm.families = meta_families(h)
         if not self._admit(asm):
             return
         self._adopt_premeta(asm)
@@ -550,9 +587,26 @@ class Catcher:
                     self.stats["data_rejected"] += 1
             asm.have = len(asm.chunks)
         for key, entry in list(asm.parities.items()):
-            if not self._parity_ok(asm, key[0], key[1], len(entry["body"])):
+            if not self._parity_ok(asm, key[0], key[1], len(entry["body"]), key[2]):
                 del asm.parities[key]
                 self.stats["parity_rejected"] += 1
+
+    def _on_heartbeat(self, h: dict) -> None:
+        """Link liveness. Counts gaps in the sender's sequence as missed heartbeats.
+
+        A new sender id (sender restart) resets the sequence. With frame auth
+        required, a replayed or old heartbeat is counted and ignored.
+        """
+        sender, seq = h["sender"], h["seq"]
+        if sender == self.heartbeat_sender:
+            if seq <= self.heartbeat_seq:
+                self.stats["heartbeat_replays"] += 1
+                return
+            self.stats["heartbeats_missed"] += seq - self.heartbeat_seq - 1
+        self.heartbeat_sender = sender
+        self.heartbeat_seq = seq
+        self.heartbeat_at = time.monotonic()
+        self.stats["heartbeats"] += 1
 
     def _record_rejected(self, tid: str, header: dict, reason: str) -> None:
         rdir = self.quarantine_dir / "_rejected"
@@ -676,15 +730,30 @@ class Catcher:
             )
         return out
 
-    def _try_fec_group(self, asm: Assembly, key: tuple[int, int]) -> None:
-        """Attempt XOR recovery for one parity group only (hot-path safe)."""
+    def _try_fec_group(self, asm: Assembly, key: tuple[int, int, int]) -> None:
+        """XOR-recover the one missing member of a group, then follow the repair.
+
+        A recovered chunk can leave a group of another family with one missing
+        member, so those groups are tried next (peeling decoder). Each step
+        repairs a chunk, so the work is bounded by the number of holes.
+        """
+        work = [key]
+        while work:
+            miss = self._repair_one(asm, work.pop())
+            if miss is not None:
+                for g, st in asm.families:
+                    nxt = self._group_key(asm, g, st, miss)
+                    if nxt in asm.parities:
+                        work.append(nxt)
+
+    def _repair_one(self, asm: Assembly, key: tuple[int, int, int]) -> int | None:
         if asm.total_chunks is None or key not in asm.parities:
-            return
+            return None
         entry = asm.parities[key]
         group = entry["group_seqs"]
         missing = [s for s in group if not asm.has_seq(s)]
         if len(missing) != 1:
-            return
+            return None
         miss = missing[0]
         mem: dict[int, bytes] = {}
         for s in group:
@@ -692,15 +761,15 @@ class Catcher:
                 continue
             body = asm.get_seq(s)
             if body is None:
-                return
+                return None
             mem[s] = body
         lens = self._lens_map(asm, group)
         if miss not in lens:
-            return
+            return None
         try:
             body = recover_missing_chunk(mem, miss, entry["body"], group, lens)
         except ValueError:
-            return
+            return None
         asm.put_seq(miss, body)
         self.stats["fec_recovered"] += 1
         if self.stats["fec_recovered"] <= 3 or self.stats["fec_recovered"] % 500 == 0:
@@ -708,6 +777,7 @@ class Catcher:
                 f"FEC recovered seq={miss} total_fec={self.stats['fec_recovered']}",
                 file=sys.stderr,
             )
+        return miss
 
     # ------------------------------------------------------------- publish
 
@@ -922,21 +992,60 @@ class Catcher:
             self._finish(asm)
 
 
-def _configure_recv_buf(sock: socket.socket, packet_size: int, want: int = 0) -> None:
+def _configure_recv_buf(sock: socket.socket, packet_size: int, want: int = 0) -> int:
+    """Ask for a large receive buffer and say so loudly when the kernel grants less.
+
+    Returns the size the kernel reports. Linux reports double what it granted
+    and caps the request at net.core.rmem_max, so a reported value below the
+    request means the cap won: raise rmem_max to at least the requested size.
+    Sizing: the buffer must absorb the longest receiver stall at line rate,
+    e.g. 100 Mbit/s x 250 ms = 3.1 MB; 32 MiB covers about 2.7 s at 100 Mbit/s.
+    """
     if want <= 0:
         want = max(32 * 1024 * 1024, 2000 * packet_size)
     try:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, want)
-        actual = sock.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF)
-        # Linux doubles the value for bookkeeping; report both.
-        print(f"SO_RCVBUF want={want} actual={actual}", file=sys.stderr)
     except OSError as exc:
-        print(f"warn: SO_RCVBUF failed: {exc}", file=sys.stderr)
+        print(f"warn: SO_RCVBUF={want} failed: {exc}", file=sys.stderr)
+    actual = sock.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF)
+    print(f"SO_RCVBUF want={want} actual={actual}", file=sys.stderr)
+    if actual < want:
+        print(
+            f"warn: kernel capped SO_RCVBUF at {actual} (< {want}); bursts will overflow it. "
+            f"Raise it: sysctl -w net.core.rmem_max={want}",
+            file=sys.stderr,
+        )
+    return actual
+
+
+def kernel_udp_counters() -> dict | None:
+    """Kernel-side UDP drop counters for this network namespace (Linux), None elsewhere.
+
+    rcvbuf_errors: datagrams dropped because a socket receive buffer was full.
+    softnet_dropped: packets dropped before any socket (netdev backlog full).
+    """
+    try:
+        lines = Path("/proc/net/snmp").read_text().splitlines()
+        udp = [ln.split() for ln in lines if ln.startswith("Udp:")]
+        out = {
+            "rcvbuf_errors": int(udp[1][udp[0].index("RcvbufErrors")]),
+            "in_errors": int(udp[1][udp[0].index("InErrors")]),
+        }
+    except (OSError, IndexError, ValueError):
+        return None
+    try:
+        out["softnet_dropped"] = sum(
+            int(ln.split()[1], 16) for ln in Path("/proc/net/softnet_stat").read_text().splitlines()
+        )
+    except (OSError, IndexError, ValueError):
+        pass
+    return out
+
 
 
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--bind", default="0.0.0.0")
+    p.add_argument("--bind", default="127.0.0.1")
     p.add_argument("--port", type=int, default=9400)
     p.add_argument("--out", type=Path, default=Path("/tmp/diode_out"))
     p.add_argument("--quarantine", type=Path, default=Path("/tmp/diode_quarantine"))
@@ -994,9 +1103,21 @@ def main() -> int:
         default=50,
         help="Write a holes receipt every N new DATA frames (0=EOF/terminal only)",
     )
+    p.add_argument(
+        "--require-frame-auth",
+        action="store_true",
+        help="Drop any data-track frame without a valid MAC from --hmac-secret",
+    )
+    p.add_argument(
+        "--insecure",
+        action="store_true",
+        help="Allow a non-loopback --bind without --hmac-secret (anyone who reaches the port can publish)",
+    )
     args = p.parse_args()
 
     secret = args.hmac_secret.encode("utf-8") if args.hmac_secret else None
+    if secret is None and args.bind not in ("127.0.0.1", "::1", "localhost") and not args.insecure:
+        p.error("--hmac-secret is required for a non-loopback --bind (or pass --insecure for a lab)")
     idle_exit = args.idle_exit if args.idle_exit is not None and args.idle_exit > 0 else None
     catcher = Catcher(
         args.out,
@@ -1010,7 +1131,12 @@ def main() -> int:
         max_active=args.max_active,
         min_free_bytes=args.min_free_bytes,
         holes_window=max(1, min(args.holes_window, 128)),
+        frame_key=frame_key(secret) if secret else None,
+        require_frame_auth=bool(args.require_frame_auth and secret),
     )
+    if args.require_frame_auth and not secret:
+        print("--require-frame-auth needs --hmac-secret", file=sys.stderr)
+        return 2
     if args.receipts is not None:
         catcher.receipts = ReceiptStore(args.receipts)
     catcher.status_only = bool(args.status_only)
