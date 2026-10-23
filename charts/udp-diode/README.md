@@ -50,7 +50,7 @@ put the sender and the receiver in different clusters, or behind a hardware diod
 |---|---|---|
 | `keys.existingSecret` | `""` | Secret with `api_token` and `data_key`. Empty: generated on first install and kept on upgrade and uninstall |
 | `sender.peer` | this release's receiver | Receiver UDP `host:port` |
-| `sender.env` | strict, families, 200 Mbit/s | Any `DIODE_*` setting (main README, "HTTP service") |
+| `sender.env` | strict, families, 100 Mbit/s | Any `DIODE_*` setting (main README, "HTTP service") |
 | `receiver.deliveryUrl` | demo sink | Where verified objects are POSTed |
 | `receiver.service.type` | `ClusterIP` | `LoadBalancer` for a sender outside the cluster |
 | `sink.enabled` | `true` | Demo destination. Turn off in production |

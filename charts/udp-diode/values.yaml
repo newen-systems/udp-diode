@@ -22,7 +22,8 @@ sender:
   peer: ""
   # Extra DIODE_* settings (README "HTTP service"). The chart sets mode, feedback, paths and peer.
   env:
-    DIODE_MAX_BITRATE_MBPS: "200"
+    # Pacing cap. Raise it only after checking the path loses nothing at the higher rate.
+    DIODE_MAX_BITRATE_MBPS: "100"
     # Strict one-way: one pass with interleaved parity families.
     DIODE_PASSES: "1"
     DIODE_FEC_FAMILIES: "12x240,12x248,12x256"
