@@ -36,7 +36,9 @@ jobs:
           kind load docker-image localhost/udp-diode:ci
           kubectl create namespace udp-diode
           kubectl label namespace udp-diode pod-security.kubernetes.io/enforce=restricted
-          helm install udp-diode charts/udp-diode -n udp-diode --wait --timeout 5m \
+          # kindnet enforces NetworkPolicy in user space and drops the start of a UDP burst
+          # (about 1,000 datagrams per transfer), so policies stay off here. They are checked by lint.
+          helm install udp-diode charts/udp-diode -n udp-diode --wait --timeout 5m --set networkPolicy.enabled=false \
             --set image.repository=localhost/udp-diode --set image.tag=ci --set image.pullPolicy=Never
           helm test udp-diode -n udp-diode --logs
       - if: failure()

@@ -24,7 +24,9 @@ Nothing in the chart checks these.
 - A default StorageClass, or `sender.persistence.storageClass` and
   `receiver.persistence.storageClass` (one RWO volume per role for spool and ledger).
 - A CNI that enforces NetworkPolicy (Canal on RKE2, Calico, Cilium). Without one
-  the policies are accepted and do nothing.
+  the policies are accepted and do nothing. On kind, kindnet's user-space policy
+  check lost about 1,000 datagrams at the start of each transfer in CI, more than
+  the parity recovers. Set `networkPolicy.enabled=false` there.
 - DNS pods labelled `k8s-app: kube-dns` (true for RKE2, kubeadm, kind, EKS, GKE).
   Otherwise set `networkPolicy.dns`.
 - For a sender in another cluster: a LoadBalancer or NodePort that passes UDP.
