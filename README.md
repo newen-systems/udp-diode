@@ -11,7 +11,7 @@ Python only, running as uid 10001 with a read-only root filesystem.
 
 ```bash
 # pull a release (linux/amd64 and linux/arm64)
-podman pull ghcr.io/newen-systems/udp-diode:0.1.0     # or docker pull
+podman pull ghcr.io/newen-systems/udp-diode:0.2.0     # or docker pull
 
 # or build it yourself
 podman build -t udp-diode .                           # or docker build -t udp-diode .
@@ -23,12 +23,15 @@ ENGINE=podman tests/smoke.sh udp-diode                # ENGINE=docker for Docker
 COMPOSE="podman compose" examples/demo.sh             # default: docker compose
 COMPOSE="podman compose" examples/demo.sh receipts
 
-# Kubernetes (Kustomize): restricted Pod Security, default-deny NetworkPolicy
-kubectl apply -f examples/k8s/namespace.yaml
-(umask 077; mkdir -p keys; for k in api_token data_key; do openssl rand -hex 32 >keys/$k; done)
-kubectl -n udp-diode create secret generic udp-diode-keys --from-file=keys/
-kubectl apply -k examples/k8s
+# Kubernetes (Helm): sender, receiver and demo sink, restricted Pod Security, default-deny NetworkPolicy
+kubectl create namespace udp-diode
+kubectl label namespace udp-diode pod-security.kubernetes.io/enforce=restricted
+helm install udp-diode oci://ghcr.io/newen-systems/charts/udp-diode -n udp-diode --wait
+helm test udp-diode -n udp-diode --logs              # POSTs 4 MiB, checks the SHA-256 at the sink
 ```
+
+The chart, a sender-only and receiver-only install for two clusters, and every value
+are in [charts/udp-diode](charts/udp-diode/README.md).
 
 Releases: push a tag `vX.Y.Z` that matches `VERSION`. The `build` workflow builds
 amd64 and arm64 with buildah, smoke-tests with podman, pushes

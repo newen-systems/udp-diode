@@ -1,0 +1,19 @@
+{{- $full := include "udp-diode.fullname" . -}}
+udp-diode {{ .Chart.AppVersion }} in namespace {{ .Release.Namespace }}: {{ if .Values.sender.enabled }}sender {{ end }}{{ if .Values.receiver.enabled }}receiver {{ end }}{{ if .Values.sink.enabled }}demo-sink{{ end }}
+{{- if and .Values.sender.enabled .Values.receiver.enabled .Values.sink.enabled }}
+
+End-to-end check (POSTs 4 MiB, waits for the sink to report the same SHA-256):
+  helm test {{ .Release.Name }} -n {{ .Release.Namespace }} --logs
+{{- end }}
+{{- if .Values.sender.enabled }}
+
+Send an object (API token from Secret {{ include "udp-diode.keysSecret" . }}, key api_token):
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ $full }}-sender 8080:8080
+  kubectl -n {{ .Release.Namespace }} get secret {{ include "udp-diode.keysSecret" . }} -o jsonpath='{.data.api_token}' | base64 -d | sed 's/^/Authorization: Bearer /' > auth
+  curl -X POST localhost:8080/v1/transfers -H @auth -H 'Idempotency-Key: first' --data-binary @FILE
+{{- end }}
+{{- if and .Values.receiver.enabled (ne .Values.receiver.service.type "ClusterIP") }}
+
+Senders outside the cluster send UDP to the receiver Service on port 9400:
+  kubectl -n {{ .Release.Namespace }} get svc {{ $full }}-receiver
+{{- end }}

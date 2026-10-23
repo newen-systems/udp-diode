@@ -17,11 +17,30 @@ jobs:
       - run: python -m pip install pytest
       - run: python -m pytest -q
       - run: tests/release.sh
-      - name: Kubernetes example renders
+      - name: Helm chart lints and renders
         run: |
-          kubectl kustomize examples/k8s > rendered.yaml
-          grep -q 'image: ghcr.io/newen-systems/udp-diode:' rendered.yaml
-          grep -q 'pod-security.kubernetes.io/enforce: restricted' rendered.yaml
+          helm lint --strict charts/udp-diode
+          for f in values-sender.yaml values-receiver.yaml; do helm lint --strict charts/udp-diode -f charts/udp-diode/examples/$f; done
+          test "$(helm show chart charts/udp-diode | sed -n 's/^version: //p')" = "$(cat VERSION)"
+          test "$(helm show chart charts/udp-diode | sed -n 's/^appVersion: //p' | tr -d '"')" = "$(cat VERSION)"
+
+  helm:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install the chart on kind and run helm test
+        run: |
+          docker build -t localhost/udp-diode:ci .
+          kind create cluster --wait 120s
+          kind load docker-image localhost/udp-diode:ci
+          kubectl create namespace udp-diode
+          kubectl label namespace udp-diode pod-security.kubernetes.io/enforce=restricted
+          helm install udp-diode charts/udp-diode -n udp-diode --wait --timeout 5m \
+            --set image.repository=localhost/udp-diode --set image.tag=ci --set image.pullPolicy=Never
+          helm test udp-diode -n udp-diode --logs
+      - if: failure()
+        run: kubectl -n udp-diode get all,events; kubectl -n udp-diode logs -l app.kubernetes.io/name=udp-diode --all-containers --tail=50
 
   compose:
     runs-on: ubuntu-24.04

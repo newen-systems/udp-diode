@@ -1,0 +1,19 @@
+# High side: receiver only, UDP in through a LoadBalancer, objects POSTed to your destination.
+#   kubectl -n udp-diode create secret generic udp-diode-keys --from-file=api_token --from-file=data_key
+#   helm install udp-diode oci://ghcr.io/newen-systems/charts/udp-diode -n udp-diode -f values-receiver.yaml
+keys:
+  existingSecret: udp-diode-keys  # same two keys as the sender side
+sender: {enabled: false}
+sink: {enabled: false}
+receiver:
+  deliveryUrl: http://ingest.example.internal:8080/objects
+  service:
+    type: LoadBalancer
+networkPolicy:
+  # Load balancers usually SNAT, so this is the node or LB address range, not the sender's.
+  receiverIngress:
+    - from: [{ipBlock: {cidr: 192.0.2.0/24}}]
+      ports: [{port: 9400, protocol: UDP}]
+  receiverEgress:
+    - to: [{ipBlock: {cidr: 198.51.100.10/32}}]
+      ports: [{port: 8080, protocol: TCP}]

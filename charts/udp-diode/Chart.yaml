@@ -1,0 +1,9 @@
+apiVersion: v2
+name: udp-diode
+description: One-way file transfer over UDP (sender, receiver and an optional demo sink)
+type: application
+version: 0.2.0
+appVersion: "0.2.0"
+home: https://github.com/newen-systems/udp-diode
+sources: [https://github.com/newen-systems/udp-diode]
+keywords: [data-diode, udp, one-way]
