@@ -2,16 +2,24 @@ udp-diode moves files one way over UDP between two HTTP custody services. A clie
 
 ## Run it
 
-`podman pull ghcr.io/newen-systems/udp-diode:0.1.0` (or docker), then see the README "Run it" section for Compose, the end-to-end smoke test and the Kubernetes (Kustomize) example. `podman build .` or `docker build .` builds it from source.
+- Container: `podman pull ghcr.io/newen-systems/udp-diode:0.2.0` (or docker). `podman build .` or `docker build .` builds it from source.
+- Kubernetes: `helm install udp-diode oci://ghcr.io/newen-systems/charts/udp-diode -n udp-diode`, then `helm test udp-diode -n udp-diode --logs`. See `charts/udp-diode/README.md`.
+
+## In 0.2.0
+
+- Helm chart, published to `oci://ghcr.io/newen-systems/charts/udp-diode` with each release. It replaces the Kustomize example.
+  - Sender, receiver and demo sink in one namespace by default, or each side alone for two clusters.
+  - Keys are generated and kept, or taken from an existing Secret.
+  - Restricted Pod Security, a ServiceAccount per role with no token, default-deny NetworkPolicy.
+  - `helm test` checks an end-to-end transfer.
+- No change to the protocol or the image.
 
 ## In 0.1.0
 
-- One image, two roles (`DIODE_MODE=sender|receiver`): standard-library Python, uid 10001, read-only root filesystem, no package manager tooling.
+- One image, two roles (`DIODE_MODE=sender|receiver`): standard-library Python, uid 10001, read-only root filesystem.
 - Strict one-way mode (`DIODE_FEEDBACK=off`) and receipt mode (`receipts`).
 - Per-frame HMAC on every data-track frame (`DIODE_FRAME_AUTH`, on by default), META HMAC and whole-object SHA-256 before publish.
 - Interleaved multi-family XOR parity (`DIODE_FEC_FAMILIES`) for single-pass strict transfers. Measured over a site VPN at 68.8 Mbit/s with 14 of 14 delivered (64 to 512 MiB), against 43.9 Mbit/s for two passes on the same path.
-- Signed heartbeat, drop counters by reason, kernel UDP counters and a receive-buffer warning in `/v1/stats`.
-- Kubernetes example with restricted Pod Security, a ServiceAccount per role with no token, and default-deny NetworkPolicy.
 
 ## Security
 

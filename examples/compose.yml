@@ -70,7 +70,7 @@ services:
     image: udp-diode:dev
     build: {context: .., dockerfile: Dockerfile}
     entrypoint: ["python", "/sink.py"]
-    volumes: ["./k8s/sink.py:/sink.py:ro"]
+    volumes: ["../charts/udp-diode/files/sink.py:/sink.py:ro"]
     read_only: true
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]

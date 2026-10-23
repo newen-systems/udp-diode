@@ -1,0 +1,54 @@
+{{- if and .Values.sender.enabled .Values.receiver.enabled .Values.sink.enabled }}
+{{- $full := include "udp-diode.fullname" . }}
+# helm test: POST 4 MiB of random bytes to the sender, then wait for the sink to
+# report the same SHA-256 after the receiver delivered it.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: {{ $full }}-test
+  labels: {{- include "udp-diode.labels" (list . "test") | nindent 4 }}
+  annotations:
+    helm.sh/hook: test
+    helm.sh/hook-delete-policy: before-hook-creation  # kept until the next run so --logs can read it
+spec:
+  restartPolicy: Never
+  automountServiceAccountToken: false
+  {{- with .Values.imagePullSecrets }}
+  imagePullSecrets: {{- toYaml . | nindent 4 }}
+  {{- end }}
+  securityContext: {{- include "udp-diode.podSecurityContext" . | nindent 4 }}
+  containers:
+    - name: transfer
+      image: {{ include "udp-diode.image" . }}
+      imagePullPolicy: {{ .Values.image.pullPolicy }}
+      command:
+        - python
+        - -c
+        - |
+          import hashlib, json, os, sys, time, urllib.request as u
+          body = os.urandom(4 << 20)
+          want = hashlib.sha256(body).hexdigest()
+          token = open("/run/secrets/diode/api_token").read().strip()
+          req = u.Request("http://{{ $full }}-sender:8080/v1/transfers", data=body, method="POST", headers={
+              "Authorization": "Bearer " + token, "Idempotency-Key": "helm-test-" + want[:16],
+              "Content-Type": "application/octet-stream"})
+          print("POST", u.urlopen(req, timeout=60).status, want)
+          for _ in range(120):
+              got = json.load(u.urlopen("http://{{ $full }}-sink:8081/received", timeout=5))
+              if any(r["sha256"] == want for r in got):
+                  sys.exit(print("PASS delivered", want))
+              time.sleep(1)
+          sys.exit("FAIL sink never received " + want)
+      resources:
+        requests: {cpu: 50m, memory: 64Mi}
+        limits: {memory: 128Mi}
+      securityContext: {{- include "udp-diode.containerSecurityContext" . | nindent 8 }}
+      volumeMounts:
+        - {name: keys, mountPath: /run/secrets/diode, readOnly: true}
+  volumes:
+    - name: keys
+      secret:
+        secretName: {{ include "udp-diode.keysSecret" . }}
+        defaultMode: 0440
+        items: [{key: api_token, path: api_token}]
+{{- end }}

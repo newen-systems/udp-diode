@@ -1,0 +1,116 @@
+{{- if .Values.networkPolicy.enabled }}
+{{- $np := .Values.networkPolicy }}
+{{- $dns := dict "to" (list (dict "namespaceSelector" $np.dns.namespaceSelector "podSelector" $np.dns.podSelector))
+      "ports" (list (dict "port" 53 "protocol" "UDP") (dict "port" 53 "protocol" "TCP")) }}
+{{- $ := . }}
+# Default deny for this release's pods, then only the one-way path:
+# sender -> receiver UDP 9400 -> destination. Nothing flows from the receiver back.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "udp-diode.fullname" . }}-default-deny
+  labels: {{- include "udp-diode.labels" (list . "network") | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: {{ .Chart.Name }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  policyTypes: [Ingress, Egress]
+{{- if .Values.sender.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "udp-diode.fullname" . }}-sender
+  labels: {{- include "udp-diode.labels" (list . "sender") | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels: {{- include "udp-diode.selector" (list . "sender") | nindent 6 }}
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - ports: [{port: 8080, protocol: TCP}]
+      {{- with $np.senderClients }}
+      from: {{- toYaml . | nindent 8 }}
+      {{- end }}
+  egress:
+    {{- if .Values.receiver.enabled }}
+    - to:
+        - podSelector:
+            matchLabels: {{- include "udp-diode.selector" (list . "receiver") | nindent 14 }}
+      ports: [{port: 9400, protocol: UDP}]
+    {{- end }}
+    {{- toYaml (append $np.senderEgress $dns) | nindent 4 }}
+{{- end }}
+{{- if .Values.receiver.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "udp-diode.fullname" . }}-receiver
+  labels: {{- include "udp-diode.labels" (list . "receiver") | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels: {{- include "udp-diode.selector" (list . "receiver") | nindent 6 }}
+  policyTypes: [Ingress, Egress]
+  ingress:
+    {{- if .Values.sender.enabled }}
+    - from:
+        - podSelector:
+            matchLabels: {{- include "udp-diode.selector" (list . "sender") | nindent 14 }}
+      ports: [{port: 9400, protocol: UDP}]
+    {{- end }}
+    # Probes and operator reads of /v1/stats (token protected).
+    - ports: [{port: 8080, protocol: TCP}]
+    {{- with $np.receiverIngress }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  egress:
+    {{- if .Values.sink.enabled }}
+    - to:
+        - podSelector:
+            matchLabels: {{- include "udp-diode.selector" (list . "sink") | nindent 14 }}
+      ports: [{port: 8081, protocol: TCP}]
+    {{- end }}
+    {{- toYaml (append $np.receiverEgress $dns) | nindent 4 }}
+{{- end }}
+{{- if .Values.sink.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "udp-diode.fullname" . }}-sink
+  labels: {{- include "udp-diode.labels" (list . "sink") | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels: {{- include "udp-diode.selector" (list . "sink") | nindent 6 }}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels: {{- include "udp-diode.selector" (list . "receiver") | nindent 14 }}
+        - podSelector:
+            matchLabels: {{- include "udp-diode.selector" (list . "test") | nindent 14 }}
+      ports: [{port: 8081, protocol: TCP}]
+---
+# helm test: the test pod reaches the sender API and reads the sink.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "udp-diode.fullname" . }}-test
+  labels: {{- include "udp-diode.labels" (list . "test") | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels: {{- include "udp-diode.selector" (list . "test") | nindent 6 }}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - podSelector:
+            matchLabels: {{- include "udp-diode.selector" (list . "sender") | nindent 14 }}
+      ports: [{port: 8080, protocol: TCP}]
+    - to:
+        - podSelector:
+            matchLabels: {{- include "udp-diode.selector" (list . "sink") | nindent 14 }}
+      ports: [{port: 8081, protocol: TCP}]
+    {{- toYaml (list $dns) | nindent 4 }}
+{{- end }}
+{{- end }}

@@ -1,0 +1,134 @@
+{{- $full := include "udp-diode.fullname" . }}
+{{- range $role := list "sender" "receiver" }}
+{{- $v := index $.Values $role }}
+{{- if $v.enabled }}
+{{- $name := printf "%s-%s" $full $role }}
+{{- $env := dict "DIODE_MODE" $role "DIODE_FEEDBACK" "off" "DIODE_STATE_DIR" "/var/lib/diode"
+      "DIODE_API_TOKEN_FILE" "/run/secrets/diode/api_token" "DIODE_DATA_KEY_FILE" "/run/secrets/diode/data_key" }}
+{{- if eq $role "sender" }}
+{{- $peer := $v.peer }}
+{{- if not $peer }}
+{{- if not $.Values.receiver.enabled }}{{ fail "sender.peer is required when receiver.enabled is false" }}{{ end }}
+{{- $peer = printf "%s-receiver:9400" $full }}
+{{- end }}
+{{- $_ := set $env "DIODE_DATA_PEER" $peer }}
+{{- else }}
+{{- $url := $v.deliveryUrl }}
+{{- if not $url }}
+{{- if not $.Values.sink.enabled }}{{ fail "receiver.deliveryUrl is required when sink.enabled is false" }}{{ end }}
+{{- $url = printf "http://%s-sink:8081/ingest" $full }}
+{{- end }}
+{{- $_ := set $env "DIODE_DELIVERY_URL" $url }}
+{{- end }}
+{{- $env = merge $env $v.env }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $name }}
+  labels: {{- include "udp-diode.labels" (list $ $role) | nindent 4 }}
+data:
+  {{- range $k, $val := $env }}
+  {{ $k }}: {{ toString $val | quote }}
+  {{- end }}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $name }}
+  labels: {{- include "udp-diode.labels" (list $ $role) | nindent 4 }}
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ $name }}
+  labels: {{- include "udp-diode.labels" (list $ $role) | nindent 4 }}
+spec:
+  accessModes: [ReadWriteOnce]
+  {{- with $v.persistence.storageClass }}
+  storageClassName: {{ . }}
+  {{- end }}
+  resources: {requests: {storage: {{ $v.persistence.size }}}}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}
+  labels: {{- include "udp-diode.labels" (list $ $role) | nindent 4 }}
+spec:
+  # One writer per state volume (RWO). Recreate keeps two pods off the same ledger.
+  replicas: 1
+  strategy: {type: Recreate}
+  revisionHistoryLimit: 3
+  selector:
+    matchLabels: {{- include "udp-diode.selector" (list $ $role) | nindent 6 }}
+  template:
+    metadata:
+      labels: {{- include "udp-diode.labels" (list $ $role) | nindent 8 }}
+      annotations:
+        # env from a ConfigMap does not reload, so a config change rolls the pod.
+        checksum/config: {{ toYaml $env | sha256sum }}
+    spec:
+      serviceAccountName: {{ $name }}
+      automountServiceAccountToken: false
+      {{- with $.Values.imagePullSecrets }}
+      imagePullSecrets: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext: {{- include "udp-diode.podSecurityContext" $ | nindent 8 }}
+      terminationGracePeriodSeconds: 20
+      {{- with $v.nodeSelector }}
+      nodeSelector: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $v.tolerations }}
+      tolerations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $v.affinity }}
+      affinity: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: diode
+          image: {{ include "udp-diode.image" $ }}
+          imagePullPolicy: {{ $.Values.image.pullPolicy }}
+          envFrom: [{configMapRef: {name: {{ $name }}}}]
+          ports:
+            - {name: http, containerPort: 8080, protocol: TCP}
+            {{- if eq $role "receiver" }}
+            - {name: data, containerPort: 9400, protocol: UDP}
+            {{- end }}
+          # Liveness checks only the process. Readiness checks spool, ledger and workers.
+          livenessProbe: {httpGet: {path: /healthz, port: http}, periodSeconds: 10, timeoutSeconds: 3}
+          readinessProbe: {httpGet: {path: /readyz, port: http}, periodSeconds: 5, timeoutSeconds: 3}
+          resources: {{- toYaml $v.resources | nindent 12 }}
+          securityContext: {{- include "udp-diode.containerSecurityContext" $ | nindent 12 }}
+          volumeMounts:
+            - {name: state, mountPath: /var/lib/diode}
+            - {name: keys, mountPath: /run/secrets/diode, readOnly: true}
+            - {name: tmp, mountPath: /tmp}
+      volumes:
+        - {name: state, persistentVolumeClaim: {claimName: {{ $name }}}}
+        - name: keys
+          secret:
+            secretName: {{ include "udp-diode.keysSecret" $ }}
+            defaultMode: 0440
+            items: [{key: api_token, path: api_token}, {key: data_key, path: data_key}]
+        - {name: tmp, emptyDir: {sizeLimit: 16Mi}}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  labels: {{- include "udp-diode.labels" (list $ $role) | nindent 4 }}
+  {{- with $v.service.annotations }}
+  annotations: {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ $v.service.type }}
+  selector: {{- include "udp-diode.selector" (list $ $role) | nindent 4 }}
+  ports:
+    - {name: http, port: 8080, targetPort: http, protocol: TCP}
+    {{- if eq $role "receiver" }}
+    - {name: data, port: 9400, targetPort: data, protocol: UDP}
+    {{- end }}
+{{- end }}
+{{- end }}

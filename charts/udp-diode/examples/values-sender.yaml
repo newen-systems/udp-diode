@@ -1,0 +1,13 @@
+# Low side: sender only, UDP out to the receiver's LoadBalancer address.
+#   kubectl -n udp-diode create secret generic udp-diode-keys --from-file=api_token --from-file=data_key
+#   helm install udp-diode oci://ghcr.io/newen-systems/charts/udp-diode -n udp-diode -f values-sender.yaml
+keys:
+  existingSecret: udp-diode-keys  # same two keys as the receiver side
+receiver: {enabled: false}
+sink: {enabled: false}
+sender:
+  peer: 203.0.113.20:9400
+networkPolicy:
+  senderEgress:
+    - to: [{ipBlock: {cidr: 203.0.113.20/32}}]
+      ports: [{port: 9400, protocol: UDP}]

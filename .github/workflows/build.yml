@@ -22,6 +22,7 @@ jobs:
           .github/scripts/release.sh check "$(cat VERSION)"
           tests/release.sh
           .github/scripts/release.sh decide "$GITHUB_REF" "$(cat VERSION)"  # a tag that does not match VERSION fails here, before any build
+          test "$(helm show chart charts/udp-diode | sed -n 's/^version: //p')" = "$(cat VERSION)"  # chart and image release together
       - name: Build amd64 and arm64 with buildah
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq qemu-user-static
@@ -96,6 +97,15 @@ jobs:
           if [ "$RELEASE" = true ]; then tags+=("$VERSION" "${VERSION%.*}" "${VERSION%%.*}" latest); fi
           for t in "${tags[@]}"; do skopeo copy --all --preserve-digests "docker://$IMAGE:$GITHUB_SHA" "docker://$IMAGE:$t"; done
           for t in "${tags[@]}"; do test "$(skopeo inspect --raw "docker://$IMAGE:$t" | sha256sum)" = "$(skopeo inspect --raw "docker://$IMAGE:$GITHUB_SHA" | sha256sum)"; done
+      - name: Push the Helm chart to ghcr.io
+        if: steps.decide.outputs.release == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.decide.outputs.version }}
+        run: |
+          printf %s "$GH_TOKEN" | helm registry login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          helm package charts/udp-diode
+          helm push "udp-diode-$VERSION.tgz" oci://ghcr.io/newen-systems/charts
       - name: Create the GitHub Release for the tag
         if: steps.decide.outputs.release == 'true'
         env:
@@ -106,6 +116,7 @@ jobs:
           {
             cat RELEASE_NOTES.md
             printf '\n## Image\n\n`%s:%s` (also `%s`, `%s` and `latest`), linux/amd64 and linux/arm64, uid 10001.\n\n' "$IMAGE" "$VERSION" "${VERSION%.*}" "${VERSION%%.*}"
+            printf 'Helm chart: `helm install udp-diode oci://ghcr.io/newen-systems/charts/udp-diode --version %s`\n\n' "$VERSION"
             printf 'Manifest list: `%s@sha256:%s`\n\n' "$IMAGE" "$(printf %s "$raw" | sha256sum | cut -d' ' -f1)"
             printf %s "$raw" | jq -r '.manifests[] | "- \(.platform.os)/\(.platform.architecture): `\(.digest)`"'
           } > notes.md

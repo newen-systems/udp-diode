@@ -23,7 +23,7 @@ hardened=(--read-only --cap-drop ALL --security-opt no-new-privileges --tmpfs /t
 keys=(-v "$WORK:/run/secrets/diode:ro" -e DIODE_API_TOKEN_FILE=/run/secrets/diode/api_token
       -e DIODE_DATA_KEY_FILE=/run/secrets/diode/data_key -e DIODE_STATE_DIR=/var/lib/diode)
 
-"$ENGINE" run -d --name "$N-sink" "${hardened[@]}" -v "$PWD/examples/k8s/sink.py:/sink.py:ro" \
+"$ENGINE" run -d --name "$N-sink" "${hardened[@]}" -v "$PWD/charts/udp-diode/files/sink.py:/sink.py:ro" \
   --entrypoint python "$IMAGE" /sink.py >/dev/null
 "$ENGINE" run -d --name "$N-receiver" "${hardened[@]}" "${keys[@]}" -v "$N-rx:/var/lib/diode" \
   -e DIODE_MODE=receiver -e DIODE_DELIVERY_URL="http://$N-sink:8081/ingest" "$IMAGE" >/dev/null

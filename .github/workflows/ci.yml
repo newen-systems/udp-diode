@@ -1,5 +1,8 @@
 name: ci
-on: [push, pull_request]
+on:
+  push:
+    branches: [main]
+  pull_request:
 permissions:
   contents: read
 concurrency:
@@ -17,11 +20,37 @@ jobs:
       - run: python -m pip install pytest
       - run: python -m pytest -q
       - run: tests/release.sh
-      - name: Kubernetes example renders
+      - name: Helm chart lints and renders
         run: |
-          kubectl kustomize examples/k8s > rendered.yaml
-          grep -q 'image: ghcr.io/newen-systems/udp-diode:' rendered.yaml
-          grep -q 'pod-security.kubernetes.io/enforce: restricted' rendered.yaml
+          helm lint --strict charts/udp-diode
+          for f in values-sender.yaml values-receiver.yaml; do helm lint --strict charts/udp-diode -f charts/udp-diode/examples/$f; done
+          test "$(helm show chart charts/udp-diode | sed -n 's/^version: //p')" = "$(cat VERSION)"
+          test "$(helm show chart charts/udp-diode | sed -n 's/^appVersion: //p' | tr -d '"')" = "$(cat VERSION)"
+
+  helm:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install the chart on kind and run helm test
+        run: |
+          docker build -t localhost/udp-diode:ci .
+          kind create cluster --wait 120s
+          kind load docker-image localhost/udp-diode:ci
+          kubectl create namespace udp-diode
+          kubectl label namespace udp-diode pod-security.kubernetes.io/enforce=restricted
+          # kindnet enforces NetworkPolicy in user space and drops the start of a UDP burst
+          # (about 1,000 datagrams per transfer), so policies stay off here. They are checked by lint.
+          helm install udp-diode charts/udp-diode -n udp-diode --wait --timeout 5m --set networkPolicy.enabled=false \
+            --set image.repository=localhost/udp-diode --set image.tag=ci --set image.pullPolicy=Never
+          helm test udp-diode -n udp-diode --logs
+      - if: failure()
+        run: |
+          kubectl -n udp-diode get all,events
+          for r in sender receiver; do
+            echo "--- $r"; kubectl -n udp-diode logs deploy/udp-diode-$r | grep -v '"GET /' | tail -40
+            kubectl -n udp-diode exec deploy/udp-diode-$r -- python -c 'import urllib.request as u; t=open("/run/secrets/diode/api_token").read().strip(); print(u.urlopen(u.Request("http://127.0.0.1:8080/v1/stats", headers={"Authorization": "Bearer " + t})).read().decode())'
+          done
 
   compose:
     runs-on: ubuntu-24.04

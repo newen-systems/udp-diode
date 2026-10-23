@@ -1,0 +1,89 @@
+# Default install: sender, receiver and demo sink in one namespace, strict one-way
+# (no feedback), NetworkPolicy keeping the data path sender -> receiver -> sink.
+# For a real boundary install the sender and the receiver in different clusters
+# (examples/values-sender.yaml and examples/values-receiver.yaml in the chart).
+
+image:
+  repository: ghcr.io/newen-systems/udp-diode
+  tag: ""  # empty: the chart appVersion. Pin a digest in production with tag: "0.2.0@sha256:..."
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+# Both sides need the same api_token (HTTP bearer) and data_key (frame HMAC), each at
+# least 16 printable bytes. Empty existingSecret: the chart generates both on first
+# install and keeps them across upgrades. A split install or GitOps (helm template
+# renders new random keys every time) must name a Secret made outside the chart.
+keys:
+  existingSecret: ""
+
+sender:
+  enabled: true
+  # Receiver UDP address host:port. Empty: this release's receiver Service.
+  peer: ""
+  # Extra DIODE_* settings (README "HTTP service"). The chart sets mode, feedback, paths and peer.
+  env:
+    # Pacing cap. Raise it only after checking the path loses nothing at the higher rate.
+    DIODE_MAX_BITRATE_MBPS: "100"
+    # Strict one-way: one pass with interleaved parity families.
+    DIODE_PASSES: "1"
+    DIODE_FEC_FAMILIES: "12x240,12x248,12x256"
+    DIODE_PARITY_GROUP: "0"
+  persistence:
+    size: 4Gi
+    storageClass: ""  # empty: cluster default
+  service:
+    type: ClusterIP
+    annotations: {}
+  resources:
+    requests: {cpu: 250m, memory: 128Mi}
+    limits: {memory: 512Mi}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+receiver:
+  enabled: true
+  # Where verified objects are POSTed. Empty: the demo sink (needs sink.enabled).
+  deliveryUrl: ""
+  env:
+    DIODE_RAM_MAX_BYTES: "67108864"
+    DIODE_RAM_BUDGET_BYTES: "268435456"
+  persistence:
+    size: 4Gi
+    storageClass: ""
+  # LoadBalancer or NodePort when the sender runs in another cluster. The UDP data port
+  # and the HTTP port share this Service.
+  service:
+    type: ClusterIP
+    annotations: {}
+  # Memory limit above DIODE_RAM_BUDGET_BYTES plus working set.
+  resources:
+    requests: {cpu: 250m, memory: 256Mi}
+    limits: {memory: 768Mi}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+# Demo destination: records the size and SHA-256 of each delivered object (GET /received).
+sink:
+  enabled: true
+  resources:
+    requests: {cpu: 50m, memory: 32Mi}
+    limits: {memory: 128Mi}
+
+# Default deny for the release's pods, then only the one-way path. Needs a CNI that
+# enforces NetworkPolicy (Canal, Calico, Cilium). Extra rules are plain NetworkPolicy
+# peers/ports, for example a CIDR for a sender or destination outside the cluster.
+networkPolicy:
+  enabled: true
+  dns:
+    namespaceSelector: {}
+    podSelector: {matchLabels: {k8s-app: kube-dns}}
+  # Who may POST to the sender on 8080. Empty: any pod or address.
+  senderClients: []
+  # Extra egress for the sender, e.g. [{to: [{ipBlock: {cidr: 10.0.0.5/32}}], ports: [{port: 9400, protocol: UDP}]}]
+  senderEgress: []
+  # Extra ingress for the receiver, e.g. the sender's address when it is in another cluster.
+  receiverIngress: []
+  # Extra egress for the receiver, e.g. the destination behind deliveryUrl.
+  receiverEgress: []
