@@ -40,7 +40,12 @@ jobs:
             --set image.repository=localhost/udp-diode --set image.tag=ci --set image.pullPolicy=Never
           helm test udp-diode -n udp-diode --logs
       - if: failure()
-        run: kubectl -n udp-diode get all,events; kubectl -n udp-diode logs -l app.kubernetes.io/name=udp-diode --all-containers --tail=50
+        run: |
+          kubectl -n udp-diode get all,events
+          for r in sender receiver; do
+            echo "--- $r"; kubectl -n udp-diode logs deploy/udp-diode-$r | grep -v '"GET /' | tail -40
+            kubectl -n udp-diode exec deploy/udp-diode-$r -- python -c 'import urllib.request as u; t=open("/run/secrets/diode/api_token").read().strip(); print(u.urlopen(u.Request("http://127.0.0.1:8080/v1/stats", headers={"Authorization": "Bearer " + t})).read().decode())'
+          done
 
   compose:
     runs-on: ubuntu-24.04
