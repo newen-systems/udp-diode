@@ -67,7 +67,7 @@ amd64 and arm64 with buildah, smoke-tests with podman, pushes
 | META HMAC | `--hmac-secret` |
 | Atomic publish + hash gate | `.part` → final + SHA-256 |
 
-**Not included (candidates):** Reed-Solomon or RaptorQ, jumbo frames E2E, product integrations.
+**Not included (candidates):** Reed-Solomon or RaptorQ, jumbo frames E2E, product integrations, a binary frame header (JSON headers cost about 7 %), holes as ranges in receipts (repair is limited to 128 holes per receipt), loss-driven rate back-off in receipt mode, and reading the body before a `507` so clients get the status instead of a broken pipe.
 What was tried, measured and rejected (and why) is in [`results/ABSORB-RESEARCH.md`](results/ABSORB-RESEARCH.md).
 
 ## Quick start
