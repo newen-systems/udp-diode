@@ -27,6 +27,8 @@ FEEDBACK = ("off", "receipts")
 ONOFF = ("on", "off")
 GiB = 1024**3
 MiB = 1024**2
+# One-way default: survives VPN loss bursts up to 240 chunks in one pass (results/ABSORB-RESEARCH.md).
+DEFAULT_FEC_FAMILIES = ((12, 240), (12, 248), (12, 256))
 
 
 class ConfigError(ValueError):
@@ -221,6 +223,16 @@ class _Reader:
         return Path(value)
 
 
+def _families(r: _Reader, receipts: bool, parity: int) -> tuple[tuple[int, int], ...]:
+    """Unset: the default families in one-way mode without DIODE_PARITY_GROUP. 'off': none."""
+    raw = r._raw("DIODE_FEC_FAMILIES")
+    if raw == "off":
+        return ()
+    if raw is None:
+        return () if receipts or parity else DEFAULT_FEC_FAMILIES
+    return r.families("DIODE_FEC_FAMILIES")
+
+
 def load(env: Mapping[str, str] | None = None) -> Config:
     """Build a Config from the environment or raise ConfigError listing every problem."""
     r = _Reader(os.environ if env is None else env)
@@ -301,7 +313,7 @@ def load(env: Mapping[str, str] | None = None) -> Config:
             receipt_bind=rbind or ("0.0.0.0", 9401),
             max_bitrate_mbps=r.number("DIODE_MAX_BITRATE_MBPS", 100.0, 0.001, 100000),
             parity_group=parity,
-            parity_families=r.families("DIODE_FEC_FAMILIES"),
+            parity_families=_families(r, receipts, parity),
             heartbeat_s=r.number("DIODE_HEARTBEAT_S", 5.0, 0, 3600),
             meta_copies=r.int_("DIODE_META_COPIES", 3, 1, 20),
             eof_copies=r.int_("DIODE_EOF_COPIES", 3, 1, 20),

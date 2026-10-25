@@ -2,8 +2,13 @@ udp-diode moves files one way over UDP between two HTTP custody services. A clie
 
 ## Run it
 
-- Container: `podman pull ghcr.io/newen-systems/udp-diode:0.2.0` (or docker). `podman build .` or `docker build .` builds it from source.
+- Container: `podman pull ghcr.io/newen-systems/udp-diode:0.3.0` (or docker). `podman build .` or `docker build .` builds it from source.
 - Kubernetes: `helm install udp-diode oci://ghcr.io/newen-systems/charts/udp-diode -n udp-diode`, then `helm test udp-diode -n udp-diode --logs`. See `charts/udp-diode/README.md`.
+
+## In 0.3.0
+
+- Strict one-way mode now sends interleaved parity families `12x240,12x248,12x256` by default. Set `DIODE_FEC_FAMILIES=off` for none, or set `DIODE_PARITY_GROUP` instead. Receipt mode is unchanged.
+- The chart no longer sets the families itself.
 
 ## In 0.2.0
 
