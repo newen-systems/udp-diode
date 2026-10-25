@@ -259,7 +259,10 @@ def _env(tmp: Path, **extra: str) -> dict:
 
 def test_config_toggles(tmp_path):
     cfg = diode_config.load(_env(tmp_path))
-    assert (cfg.frame_auth, cfg.parity_families, cfg.heartbeat_s, cfg.chunk_size) == (True, (), 5.0, 1200)
+    assert (cfg.frame_auth, cfg.parity_families, cfg.heartbeat_s, cfg.chunk_size) == (
+        True, diode_config.DEFAULT_FEC_FAMILIES, 5.0, 1200)
+    assert diode_config.load(_env(tmp_path, DIODE_FEC_FAMILIES="off")).parity_families == ()
+    assert diode_config.load(_env(tmp_path, DIODE_PARITY_GROUP="8")).parity_families == ()
     cfg = diode_config.load(_env(tmp_path, DIODE_FEC_FAMILIES="12x64,12x72,12x80"))
     assert cfg.parity_families == ((12, 64), (12, 72), (12, 80))
     cfg = diode_config.load(_env(tmp_path, DIODE_CHUNK_SIZE="auto", DIODE_MTU="1420"))

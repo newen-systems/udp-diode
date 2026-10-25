@@ -5,7 +5,7 @@
 
 image:
   repository: ghcr.io/newen-systems/udp-diode
-  tag: ""  # empty: the chart appVersion. Pin a digest in production with tag: "0.2.0@sha256:..."
+  tag: ""  # empty: the chart appVersion. Pin a digest in production with tag: "0.3.0@sha256:..."
   pullPolicy: IfNotPresent
 imagePullSecrets: []
 
@@ -24,10 +24,8 @@ sender:
   env:
     # Pacing cap. Raise it only after checking the path loses nothing at the higher rate.
     DIODE_MAX_BITRATE_MBPS: "100"
-    # Strict one-way: one pass with interleaved parity families.
+    # Strict one-way: one pass. The image adds parity families 12x240,12x248,12x256 by default.
     DIODE_PASSES: "1"
-    DIODE_FEC_FAMILIES: "12x240,12x248,12x256"
-    DIODE_PARITY_GROUP: "0"
   persistence:
     size: 4Gi
     storageClass: ""  # empty: cluster default

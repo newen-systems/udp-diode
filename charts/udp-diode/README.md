@@ -57,7 +57,7 @@ put the sender and the receiver in different clusters, or behind a hardware diod
 | `receiver.service.type` | `ClusterIP` | `LoadBalancer` for a sender outside the cluster |
 | `sink.enabled` | `true` | Demo destination. Turn off in production |
 | `networkPolicy.*` | on | Extra peers for senders, clients and destinations outside the release |
-| `image.tag` | chart `appVersion` | Pin a digest in production: `0.2.0@sha256:...` |
+| `image.tag` | chart `appVersion` | Pin a digest in production: `0.3.0@sha256:...` |
 
 ## Not automated
 

@@ -11,7 +11,7 @@ Python only, running as uid 10001 with a read-only root filesystem.
 
 ```bash
 # pull a release (linux/amd64 and linux/arm64)
-podman pull ghcr.io/newen-systems/udp-diode:0.2.0     # or docker pull
+podman pull ghcr.io/newen-systems/udp-diode:0.3.0     # or docker pull
 
 # or build it yourself
 podman build -t udp-diode .                           # or docker build -t udp-diode .
@@ -67,7 +67,7 @@ amd64 and arm64 with buildah, smoke-tests with podman, pushes
 | META HMAC | `--hmac-secret` |
 | Atomic publish + hash gate | `.part` → final + SHA-256 |
 
-**Not included (candidates):** Reed-Solomon or RaptorQ, jumbo frames E2E, product integrations.
+**Not included (candidates):** Reed-Solomon or RaptorQ, jumbo frames E2E, product integrations, a binary frame header (JSON headers cost about 7 %), holes as ranges in receipts (repair is limited to 128 holes per receipt), loss-driven rate back-off in receipt mode, and reading the body before a `507` so clients get the status instead of a broken pipe.
 What was tried, measured and rejected (and why) is in [`results/ABSORB-RESEARCH.md`](results/ABSORB-RESEARCH.md).
 
 ## Quick start
@@ -353,7 +353,7 @@ Transport tuning (all validated; defaults in brackets):
 | `DIODE_CHUNK_SIZE` | 1200 | DATA body bytes; rejected if the worst-case datagram exceeds `DIODE_MTU - 28`. `auto`: the largest that fits `DIODE_MTU` |
 | `DIODE_MTU` | 1500 | Path MTU the frame budget is checked against |
 | `DIODE_PARITY_GROUP` | 0 | XOR FEC group size (0 off, 2 and up) |
-| `DIODE_FEC_FAMILIES` | unset | Interleaved XOR families `GxS,...` instead of `DIODE_PARITY_GROUP`, e.g. `12x240,12x248,12x256` (about 1.37x wire with headers). See `results/ABSORB-RESEARCH.md` |
+| `DIODE_FEC_FAMILIES` | `12x240,12x248,12x256` with `DIODE_FEEDBACK=off` and no `DIODE_PARITY_GROUP`, else unset | Interleaved XOR families `GxS,...` instead of `DIODE_PARITY_GROUP` (about 1.37x wire with headers). `off` disables. See `results/ABSORB-RESEARCH.md` |
 | `DIODE_FRAME_AUTH` | on | Both roles. `on`: every data-track frame carries a 16-byte MAC and the receiver drops untagged or forged frames. Must match on both sides |
 | `DIODE_HEARTBEAT_S` | 5 | Sender sends a sequenced HEARTBEAT this often (0 off). Receiver `/v1/stats` shows `last_heartbeat_age_s` and `heartbeats_missed` |
 | `DIODE_META_COPIES`, `DIODE_EOF_COPIES` | 3, 3 | Control-frame redundancy |
