@@ -21,6 +21,7 @@ jobs:
         run: |
           .github/scripts/release.sh check "$(cat VERSION)"
           tests/release.sh
+          .github/scripts/release.sh notes "$(cat VERSION)" RELEASE_NOTES.md >/dev/null  # VERSION has its release notes before anything is built
           .github/scripts/release.sh decide "$GITHUB_REF" "$(cat VERSION)"  # a tag that does not match VERSION fails here, before any build
           test "$(helm show chart charts/udp-diode | sed -n 's/^version: //p')" = "$(cat VERSION)"  # chart and image release together
       - name: Build amd64 and arm64 with buildah
@@ -63,29 +64,39 @@ jobs:
           version=$(cat VERSION)
           echo "version=$version" >> "$GITHUB_OUTPUT"
           .github/scripts/release.sh decide "$GITHUB_REF" "$version" | tee -a "$GITHUB_OUTPUT"
+          # the commit tag is sha-<7 hex>, so no build tag can parse as a version
+          echo "REF=$IMAGE:sha-${GITHUB_SHA::7}" >> "$GITHUB_ENV"
       - name: Push the manifest list to ghcr.io
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           printf %s "$GH_TOKEN" | podman login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
-          # copying the archives straight to the registry keeps the config blob, and with it the HEALTHCHECK
+          # skopeo copies the archives, not podman, which keeps the config blob, and with it the HEALTHCHECK.
+          # Each platform image is pushed by its digest with no tag: only the manifest list is tagged.
           podman manifest create udp-diode
           for a in amd64 arm64; do
-            skopeo copy --format v2s2 docker-archive:udp-diode-$a.tar "docker://$IMAGE:$GITHUB_SHA-$a"
-            podman manifest add udp-diode "docker://$IMAGE:$GITHUB_SHA-$a"
+            skopeo copy --format v2s2 docker-archive:udp-diode-$a.tar dir:udp-diode-$a
+            d=sha256:$(sha256sum udp-diode-$a/manifest.json | cut -d' ' -f1)
+            skopeo copy --preserve-digests dir:udp-diode-$a "docker://$IMAGE@$d"
+            podman manifest add udp-diode "docker://$IMAGE@$d"
           done
           # only the sha tag moves here; the tags users pull move after the pushed image has passed
-          podman manifest push --format v2s2 udp-diode "docker://$IMAGE:$GITHUB_SHA"
-          skopeo inspect --raw "docker://$IMAGE:$GITHUB_SHA" | grep -E '"architecture"'
+          podman manifest push --format v2s2 udp-diode "docker://$REF"
+          skopeo inspect --raw "docker://$REF" | grep -E '"architecture"'
+          # skopeo inspect --config hides the field, so read each config blob itself
+          for a in amd64 arm64; do
+            skopeo --override-os linux --override-arch $a copy "docker://$REF" dir:check-$a
+            grep -lq Healthcheck check-$a/*
+          done
       - name: Run the pushed image
         env:
           VERSION: ${{ steps.decide.outputs.version }}
         run: |
-          podman pull "$IMAGE:$GITHUB_SHA"
-          test "$(podman run --rm --entrypoint id "$IMAGE:$GITHUB_SHA" -u)" = 10001
-          podman run --rm --entrypoint printenv "$IMAGE:$GITHUB_SHA" APP_VERSION | grep -qx "$VERSION"
-          podman run --rm --entrypoint printenv "$IMAGE:$GITHUB_SHA" APP_REVISION | grep -qx "$GITHUB_SHA"
-          ENGINE=podman tests/smoke.sh "$IMAGE:$GITHUB_SHA"
+          podman pull "$REF"
+          test "$(podman run --rm --entrypoint id "$REF" -u)" = 10001
+          podman run --rm --entrypoint printenv "$REF" APP_VERSION | grep -qx "$VERSION"
+          podman run --rm --entrypoint printenv "$REF" APP_REVISION | grep -qx "$GITHUB_SHA"
+          ENGINE=podman tests/smoke.sh "$REF"
       - name: Move the tags users pull
         env:
           RELEASE: ${{ steps.decide.outputs.release }}
@@ -95,8 +106,8 @@ jobs:
           tags=()
           [ "$GITHUB_REF" = refs/heads/main ] && tags+=(edge)
           if [ "$RELEASE" = true ]; then tags+=("$VERSION" "${VERSION%.*}" "${VERSION%%.*}" latest); fi
-          for t in "${tags[@]}"; do skopeo copy --all --preserve-digests "docker://$IMAGE:$GITHUB_SHA" "docker://$IMAGE:$t"; done
-          for t in "${tags[@]}"; do test "$(skopeo inspect --raw "docker://$IMAGE:$t" | sha256sum)" = "$(skopeo inspect --raw "docker://$IMAGE:$GITHUB_SHA" | sha256sum)"; done
+          for t in "${tags[@]}"; do skopeo copy --all --preserve-digests "docker://$REF" "docker://$IMAGE:$t"; done
+          for t in "${tags[@]}"; do test "$(skopeo inspect --raw "docker://$IMAGE:$t" | sha256sum)" = "$(skopeo inspect --raw "docker://$REF" | sha256sum)"; done
       - name: Push the Helm chart to ghcr.io
         if: steps.decide.outputs.release == 'true'
         env:
@@ -112,9 +123,15 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VERSION: ${{ steps.decide.outputs.version }}
         run: |
-          raw=$(skopeo inspect --raw "docker://$IMAGE:$GITHUB_SHA")
+          raw=$(skopeo inspect --raw "docker://$REF")
+          # the body is this release's section only, and the release fails without one
+          section=$(.github/scripts/release.sh notes "$VERSION" RELEASE_NOTES.md)
+          prev=$(git ls-remote --tags origin 'v*' | .github/scripts/release.sh prev "$VERSION")
           {
-            cat RELEASE_NOTES.md
+            printf '%s\n' "$section"
+            if [ -n "$prev" ]; then
+              printf '\nFull history: https://github.com/%s/compare/%s...v%s\n' "$GITHUB_REPOSITORY" "$prev" "$VERSION"
+            fi
             printf '\n## Image\n\n`%s:%s` (also `%s`, `%s` and `latest`), linux/amd64 and linux/arm64, uid 10001.\n\n' "$IMAGE" "$VERSION" "${VERSION%.*}" "${VERSION%%.*}"
             printf 'Helm chart: `helm install udp-diode oci://ghcr.io/newen-systems/charts/udp-diode --version %s`\n\n' "$VERSION"
             printf 'Manifest list: `%s@sha256:%s`\n\n' "$IMAGE" "$(printf %s "$raw" | sha256sum | cut -d' ' -f1)"
