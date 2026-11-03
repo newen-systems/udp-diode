@@ -16,5 +16,14 @@ want "tag v0.1.0 with VERSION 0.1.0 releases" release=true $r decide refs/tags/v
 bad "tag v0.2.2 with VERSION 0.1.0 fails" $r decide refs/tags/v0.2.2 0.1.0
 bad "tag v0.3.0-rc.1 fails" $r decide refs/tags/v0.3.0-rc.1 0.3.0-rc.1
 bad "tag v1.0 fails" $r decide refs/tags/v1.0 1.0
+f=$(mktemp); trap 'rm -f "$f"' EXIT
+printf '%s\n' '# Notes' '' '## In 0.2.2' '' '### Bug Fixes' '' '- b' '' '## In 0.2.1' '' '- a' > "$f"
+want "notes print one version's section" "$(printf '### Bug Fixes\n\n- b')" $r notes 0.2.2 "$f"
+want "notes stop at the next version" "- a" $r notes 0.2.1 "$f"
+bad "notes fail for a missing version" $r notes 0.2.3 "$f"
+bad "notes do not match a version prefix" $r notes 0.2 "$f"
+tags=$'abc\trefs/tags/v0.2.9\nabc\trefs/tags/v0.2.10\nabc\trefs/tags/v0.2.10^{}\nabc\trefs/tags/v0.3.0'
+want "prev sorts versions, not text" v0.2.9 bash -c "printf '%s\n' \"\$1\" | $r prev 0.2.10" _ "$tags"
+want "prev of the first release is empty" "" bash -c "printf '%s\n' \"\$1\" | $r prev 0.2.9" _ "$tags"
 echo "failures: $fails"
 exit $((fails > 0))

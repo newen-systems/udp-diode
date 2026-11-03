@@ -5,7 +5,7 @@
 
 image:
   repository: ghcr.io/newen-systems/udp-diode
-  tag: ""  # empty: the chart appVersion. Pin a digest in production with tag: "0.3.0@sha256:..."
+  tag: ""  # empty: the chart appVersion. Pin a digest in production with tag: "0.3.1@sha256:..."
   pullPolicy: IfNotPresent
 imagePullSecrets: []
 

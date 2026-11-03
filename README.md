@@ -11,7 +11,7 @@ Python only, running as uid 10001 with a read-only root filesystem.
 
 ```bash
 # pull a release (linux/amd64 and linux/arm64)
-podman pull ghcr.io/newen-systems/udp-diode:0.3.0     # or docker pull
+podman pull ghcr.io/newen-systems/udp-diode:0.3.1     # or docker pull
 
 # or build it yourself
 podman build -t udp-diode .                           # or docker build -t udp-diode .
@@ -36,7 +36,17 @@ are in [charts/udp-diode](charts/udp-diode/README.md).
 Releases: push a tag `vX.Y.Z` that matches `VERSION`. The `build` workflow builds
 amd64 and arm64 with buildah, smoke-tests with podman, pushes
 `ghcr.io/newen-systems/udp-diode:X.Y.Z` (plus `X.Y`, `X`, `latest`; `main` pushes
-`edge`) and creates the GitHub Release. Pin a digest in production.
+`edge`) and creates the GitHub Release. Pin a digest in production. Every build is
+also tagged `sha-<first 7 hex of the commit>`. The amd64 and arm64 images are pushed by
+digest with no tag and are reached through the manifest list, so no tag besides a release
+parses as a version. Tags `<full sha>`, `<full sha>-amd64` and `<full sha>-arm64` from builds
+before 0.3.1 stay, because the releases of that time use those images.
+
+`RELEASE_NOTES.md` has a `## In X.Y.Z` section per release, with entries under
+`### New Features`, `### Bug Fixes` and `### Chores` in that order (an empty heading is
+left out), one line each, ending with a commit or pull request link. The GitHub Release
+body is that section only, a link to the changes since the previous release, and the
+image and chart references. A build fails when `VERSION` has no section.
 
 ## What you get
 
