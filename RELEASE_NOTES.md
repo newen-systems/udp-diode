@@ -27,19 +27,26 @@ udp-diode moves files one way over UDP between two HTTP custody services. A clie
 
 ## In 0.2.0
 
-- Helm chart, published to `oci://ghcr.io/newen-systems/charts/udp-diode` with each release. It replaces the Kustomize example.
-  - Sender, receiver and demo sink in one namespace by default, or each side alone for two clusters.
-  - Keys are generated and kept, or taken from an existing Secret.
-  - Restricted Pod Security, a ServiceAccount per role with no token, default-deny NetworkPolicy.
-  - `helm test` checks an end-to-end transfer.
-- No change to the protocol or the image.
+### New Features
+
+- Helm chart, published to `oci://ghcr.io/newen-systems/charts/udp-diode` with each release, in place of the Kustomize example ([aa95fd1](https://github.com/newen-systems/udp-diode/commit/aa95fd1))
+- The chart installs sender, receiver and demo sink in one namespace by default, or each side alone for two clusters ([aa95fd1](https://github.com/newen-systems/udp-diode/commit/aa95fd1))
+- Keys are generated and kept, or taken from an existing Secret ([aa95fd1](https://github.com/newen-systems/udp-diode/commit/aa95fd1))
+- Restricted Pod Security, a ServiceAccount per role with no token, and a default-deny NetworkPolicy ([aa95fd1](https://github.com/newen-systems/udp-diode/commit/aa95fd1))
+- `helm test` checks an end-to-end transfer ([aa95fd1](https://github.com/newen-systems/udp-diode/commit/aa95fd1))
+
+### Chores
+
+- No change to the protocol or the image ([aa95fd1](https://github.com/newen-systems/udp-diode/commit/aa95fd1))
 
 ## In 0.1.0
 
-- One image, two roles (`DIODE_MODE=sender|receiver`): standard-library Python, uid 10001, read-only root filesystem.
-- Strict one-way mode (`DIODE_FEEDBACK=off`) and receipt mode (`receipts`).
-- Per-frame HMAC on every data-track frame (`DIODE_FRAME_AUTH`, on by default), META HMAC and whole-object SHA-256 before publish.
-- Interleaved multi-family XOR parity (`DIODE_FEC_FAMILIES`) for single-pass strict transfers. Measured over a site VPN at 68.8 Mbit/s with 14 of 14 delivered (64 to 512 MiB), against 43.9 Mbit/s for two passes on the same path.
+### New Features
+
+- One image, two roles (`DIODE_MODE=sender|receiver`): standard-library Python, uid 10001, read-only root filesystem ([3270fe4](https://github.com/newen-systems/udp-diode/commit/3270fe4))
+- Strict one-way mode (`DIODE_FEEDBACK=off`) and receipt mode (`receipts`) ([3270fe4](https://github.com/newen-systems/udp-diode/commit/3270fe4))
+- Per-frame HMAC on every data-track frame (`DIODE_FRAME_AUTH`, on by default), META HMAC and whole-object SHA-256 before publish ([0dcea89](https://github.com/newen-systems/udp-diode/commit/0dcea89))
+- Interleaved multi-family XOR parity (`DIODE_FEC_FAMILIES`) for single-pass strict transfers, measured over a site VPN at 68.8 Mbit/s with 14 of 14 delivered (64 to 512 MiB), against 43.9 Mbit/s for two passes on the same path ([0dcea89](https://github.com/newen-systems/udp-diode/commit/0dcea89))
 
 ## Security
 
